@@ -1,2 +1,15 @@
-package com.kodlamaio.commonpackage.configuration;public class ModelMapperConfig {
+package com.kodlamaio.commonpackage.configuration;
+
+import org.modelmapper.ModelMapper;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+
+@Configuration
+public class ModelMapperConfig {
+
+    @Bean
+    public ModelMapper getModelMapper()
+    {
+        return new ModelMapper();
+    }
 }

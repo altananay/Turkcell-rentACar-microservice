@@ -21,12 +21,11 @@ public class FiltersController {
 
     private final FilterService service;
 
-    @PostConstruct
+    /*@PostConstruct
     public void createDb()
     {
-
         service.add(new Filter());
-    }
+    }*/
 
     @GetMapping
     public List<GetAllFiltersResponse> getAll()

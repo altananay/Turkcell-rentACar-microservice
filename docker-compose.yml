@@ -17,6 +17,14 @@ services:
       MONGO_INITDB_ROOT_PASSWORD: "12345"
     volumes:
       - mongodb_data:/data/db
+  mongodbInvoice:
+    container_name: turkcell-invoicedb-mongodb
+    image: mongo
+    command: mongod --port 27018
+    ports:
+      - "27018:27018"
+    volumes:
+      - mongodb_data:/data/turkcell-invoicedb
   inventorydb:
     container_name: turkcell-inventorydb-mysql
     image: mysql

@@ -1,5 +1,6 @@
 package com.kodlamaio.invoiceservice.business.rules;
 
+import com.kodlamaio.commonpackage.utils.constants.Messages;
 import com.kodlamaio.commonpackage.utils.exceptions.BusinessException;
 import com.kodlamaio.invoiceservice.repository.InvoiceRepository;
 import lombok.AllArgsConstructor;
@@ -12,7 +13,7 @@ public class InvoiceBusinessRules {
 
     public void checkIfInvoiceExists(String id) {
         if (!repository.existsById(id)) {
-            throw new BusinessException("INVOICE_NOT_EXISTS");
+            throw new BusinessException(Messages.Invoice.NotExists);
         }
     }
 }

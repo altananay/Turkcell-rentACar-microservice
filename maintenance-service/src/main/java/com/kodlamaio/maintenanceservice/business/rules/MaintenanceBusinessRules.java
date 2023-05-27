@@ -1,5 +1,6 @@
 package com.kodlamaio.maintenanceservice.business.rules;
 
+import com.kodlamaio.commonpackage.utils.constants.Messages;
 import com.kodlamaio.commonpackage.utils.exceptions.BusinessException;
 import com.kodlamaio.maintenanceservice.api.clients.CarClient;
 import com.kodlamaio.maintenanceservice.repository.MaintenanceRepository;
@@ -25,13 +26,13 @@ public class MaintenanceBusinessRules {
 
     public void checkIfMaintenanceExists(UUID id) {
         if (!repository.existsById(id)) {
-            throw new BusinessException("MAINTENANCE_NOT_EXISTS");
+            throw new BusinessException(Messages.Maintenance.NotExists);
         }
     }
 
     public void checkIfCarUnderMaintenance(UUID carId) {
         if (repository.existsByCarIdAndIsCompletedIsFalse(carId)) {
-            throw new BusinessException("CAR_ALREADY_UNDER_MAINTENANCE");
+            throw new BusinessException(Messages.Maintenance.UnderMaintenance);
         }
     }
 

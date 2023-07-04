@@ -12,6 +12,7 @@ import com.kodlamaio.inventoryservice.business.dto.responses.update.UpdateCarRes
 import jakarta.validation.Valid;
 import lombok.AllArgsConstructor;
 import org.springframework.http.HttpStatus;
+import org.springframework.security.access.annotation.Secured;
 import org.springframework.web.bind.annotation.*;
 
 import java.util.List;
@@ -24,6 +25,7 @@ public class CarsController {
     private final CarService service;
 
     @GetMapping
+    @Secured("ROLE_admin")
     public List<GetAllCarsResponse> getAll()
     {
         return service.getAll();

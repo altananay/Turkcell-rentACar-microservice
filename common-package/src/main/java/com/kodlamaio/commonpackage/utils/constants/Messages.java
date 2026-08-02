@@ -3,7 +3,7 @@ package com.kodlamaio.commonpackage.utils.constants;
 public class Messages {
     public static class Car
     {
-        public static final String NotExists = "CARD_NOT_EXISTS";
+        public static final String NotExists = "CAR_NOT_EXISTS";
         public static final String AlreadyExists = "CAR_ALREADY_EXISTS";
         public static final String NotAvailable = "CAR_NOT_AVAILABLE";
     }

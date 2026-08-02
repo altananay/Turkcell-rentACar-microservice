@@ -1,7 +1,9 @@
 package com.kodlamaio.paymentservice.business.concretes;
 
+import com.kodlamaio.commonpackage.utils.constants.Messages;
 import com.kodlamaio.commonpackage.utils.dto.ClientResponse;
 import com.kodlamaio.commonpackage.utils.dto.CreateRentalPaymentRequest;
+import com.kodlamaio.commonpackage.utils.exceptions.BusinessException;
 import com.kodlamaio.commonpackage.utils.mappers.ModelMapperService;
 import com.kodlamaio.paymentservice.business.abstracts.PaymentService;
 import com.kodlamaio.paymentservice.business.abstracts.PosService;
@@ -18,6 +20,7 @@ import lombok.AllArgsConstructor;
 import org.springframework.stereotype.Service;
 
 import java.util.List;
+import java.util.Optional;
 import java.util.UUID;
 
 @Service
@@ -88,7 +91,8 @@ public class PaymentManager implements PaymentService {
         try
         {
             rules.checkIfPaymentIsValid(request);
-            Payment payment = repository.findByCardNumber(request.getCardNumber());
+            Payment payment = Optional.ofNullable(repository.findByCardNumber(request.getCardNumber()))
+                    .orElseThrow(() -> new BusinessException(Messages.Payment.NotFound));
 
             rules.checkIfBalanceIsEnough(payment.getBalance(),request.getPrice());
             //FAKE POS SERVICE

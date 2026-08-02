@@ -11,6 +11,7 @@ import com.kodlamaio.paymentservice.business.dto.responses.GetPaymentResponse;
 import com.kodlamaio.paymentservice.business.dto.responses.UpdatePaymentResponse;
 import jakarta.validation.Valid;
 import lombok.AllArgsConstructor;
+import org.springframework.http.HttpStatus;
 import org.springframework.web.bind.annotation.*;
 
 import java.util.List;
@@ -38,6 +39,7 @@ public class PaymentsController {
         return service.processRentalPayment(request);
     }
     @PostMapping
+    @ResponseStatus(HttpStatus.CREATED)
     public CreatePaymentResponse add(@Valid @RequestBody CreatePaymentRequest request) {
         return service.add(request);
     }
@@ -48,6 +50,7 @@ public class PaymentsController {
     }
 
     @DeleteMapping("/{id}")
+    @ResponseStatus(HttpStatus.NO_CONTENT)
     public void delete(@PathVariable UUID id) {
         service.delete(id);
     }

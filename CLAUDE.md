@@ -267,6 +267,10 @@ If any item below is violated, the change is invalid.
 
 Constructor injection via Lombok `@AllArgsConstructor` / `@RequiredArgsConstructor` on `final` fields. No field `@Autowired`.
 
+### Null checks
+
+Never write `x == null` / `x != null` directly. Use `java.util.Objects.isNull(x)` / `Objects.nonNull(x)` for a guard clause, or `Optional.ofNullable(x)` when the value flows into a chain (`.orElseThrow(...)`, `.map(...)`, `.ifPresentOrElse(...)`). Prefer `Optional` when it replaces a "fetch nullable value, then branch" shape (e.g. a repository lookup feeding a not-found exception); use `Objects.isNull`/`nonNull` for a simple early-return guard where wrapping in `Optional` would add ceremony without improving readability.
+
 ### Module-qualify colliding class names
 
 Several class names exist in more than one module. Always write them as `<module>/<ClassName>` in prose, commits, and reports:
@@ -298,7 +302,7 @@ Rules:
 
 - Domain failures throw `BusinessException(Messages.X.Y)` from a `*BusinessRules` class. Never invent a new exception type without adding a handler for it.
 - Bare `orElseThrow()` raises `NoSuchElementException`, which has **no handler** and falls through to 500. Guard with a `checkIfXExists` rule first — that is the existing precedent.
-- Fallback classes are inconsistent today: `rental-service/CarClientFallback` throws `BusinessException` (→ 422) while `maintenance-service/CarClientFallback` throws bare `RuntimeException` (→ 500). Match rental for any new fallback.
+- Fallback classes: `rental-service/CarClientFallback` and `maintenance-service/CarClientFallback` both throw `BusinessException` (→ 422). Match this for any new fallback.
 - Log at `WARN` for expected failures, `ERROR` for unexpected ones. Don't log and rethrow.
 
 ---
@@ -376,7 +380,7 @@ Resilience4j is on the classpath via `common-package`, but there are **zero `@Ci
 
 ## 14) Testing
 
-**Current state, honestly: 8 test classes, all default `contextLoads()` boilerplate, zero real assertions.** `common-package`'s test is staged for deletion and `InventoryServiceApplicationTests` had `@SpringBootTest` removed, so it starts no context. `spring-security-test` is not declared anywhere. The conventions below are for *adding* tests, not a description of coverage.
+**Current state:** ~162 unit tests across `common-package` and all 6 business services, covering `*Manager`, `*BusinessRules`, `*Controller`, `*Consumer`, and `*ClientFallback` classes. All are plain Mockito/AssertJ unit tests or `MockMvcBuilders.standaloneSetup` controller tests — no `@SpringBootTest`, no Spring context, no config-server or database dependency. They pass with all backing infrastructure stopped. The old default `*ApplicationTests.java` `contextLoads()` stubs (one per module, Spring Initializr boilerplate) have been deleted — they required a live config-server/Keycloak to load the context and asserted nothing. `spring-security-test` is not declared anywhere; controller tests that need `@Valid` enforcement use `standaloneSetup`, which wires Bean Validation automatically without a security context.
 
 ### Standards
 
@@ -439,14 +443,12 @@ Approved defaults (all declared in `common-package/pom.xml`):
 - Boot parent split: 3.1.0 on maintenance + payment, 3.0.6 on the other 8.
 - `payment-service` uses `entity` (singular) and declares `spring-boot-starter-test` twice.
 - `/api/payments/check` is permitAll with no controller behind it.
-- `Messages.Car.NotExists = "CARD_NOT_EXISTS"` — a typo, but it is a wire-visible contract.
 - `api-gateway`'s yml carries a stray `eureka.instance.metadata-map.serviceId: inventory-service`.
 - `prometheus.yml` scrapes `/FILTER-SERVICE/...` (uppercase, broken under `lower-case-service-id`) and omits `invoice-service` entirely.
 - No `micrometer-registry-prometheus` dependency is declared anywhere, so `/actuator/prometheus` likely 404s.
 - All backing-service credentials are committed in plaintext in `docker-compose.yml`. Acceptable only because they are throwaway local-dev values; the pattern must not follow this project to anything real.
 - Changing a database name or user in `docker-compose.yml` silently breaks the matching service until the external config repo is updated to match.
 - `common-package` ships `CommonPackageApplication` (`@SpringBootApplication`) inside the scanned `ConfigurationBasePackage`, so every service component-scans a nested application class.
-- `MaintenancesController` is the only controller whose `@RequestBody` is not `@Valid`.
 - `invoice-service` exposes only `GET /api/invoices`; its `getById` and Create/Update DTOs are unreachable over HTTP.
 - No Dockerfile exists anywhere. `docker-compose.yml` provides backing services only.
 

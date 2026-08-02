@@ -1,6 +1,5 @@
 package com.kodlamaio.inventoryservice.business.dto.requests.update;
 
-import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.NotNull;
 import jakarta.validation.constraints.Size;
 import lombok.AllArgsConstructor;
@@ -16,7 +15,7 @@ import java.util.UUID;
 @Setter
 public class UpdateBrandRequest {
 
-    @NotBlank
+    @NotNull
     private UUID id;
 
     @Size(min = 2, max = 20)

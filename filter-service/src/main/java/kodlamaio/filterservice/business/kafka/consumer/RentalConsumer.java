@@ -8,6 +8,8 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.kafka.annotation.KafkaListener;
 import org.springframework.stereotype.Service;
 
+import java.util.Objects;
+
 @Slf4j
 @Service
 @RequiredArgsConstructor
@@ -20,6 +22,10 @@ public class RentalConsumer {
     )
     public void consume(RentalCreatedEvent event) {
         var filter = service.getByCarId(event.getCarId());
+        if (Objects.isNull(filter)) {
+            log.warn("No filter found for carId {} - skipping rental created event", event.getCarId());
+            return;
+        }
         filter.setState("Rented");
         service.add(filter);
         log.info("Rental created event consumed {}", event);
@@ -31,6 +37,10 @@ public class RentalConsumer {
     )
     public void consume(RentalDeletedEvent event) {
         var filter = service.getByCarId(event.getCarId());
+        if (Objects.isNull(filter)) {
+            log.warn("No filter found for carId {} - skipping rental deleted event", event.getCarId());
+            return;
+        }
         filter.setState("Available");
         service.add(filter);
         log.info("Rental deleted event consumed {}", event);

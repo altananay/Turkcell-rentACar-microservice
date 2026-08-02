@@ -7,6 +7,7 @@ import com.kodlamaio.maintenanceservice.business.dto.responses.CreateMaintenance
 import com.kodlamaio.maintenanceservice.business.dto.responses.GetAllMaintenancesResponse;
 import com.kodlamaio.maintenanceservice.business.dto.responses.GetMaintenanceResponse;
 import com.kodlamaio.maintenanceservice.business.dto.responses.UpdateMaintenanceResponse;
+import jakarta.validation.Valid;
 import lombok.AllArgsConstructor;
 import org.springframework.http.HttpStatus;
 import org.springframework.web.bind.annotation.*;
@@ -32,13 +33,13 @@ public class MaintenancesController {
 
     @PostMapping
     @ResponseStatus(HttpStatus.CREATED)
-    public CreateMaintenanceResponse add(@RequestBody CreateMaintenanceRequest request) {
+    public CreateMaintenanceResponse add(@Valid @RequestBody CreateMaintenanceRequest request) {
         return service.add(request);
     }
 
 
     @PutMapping("/{id}")
-    public UpdateMaintenanceResponse update(@PathVariable UUID id, @RequestBody UpdateMaintenanceRequest request) {
+    public UpdateMaintenanceResponse update(@PathVariable UUID id, @Valid @RequestBody UpdateMaintenanceRequest request) {
         return service.update(id, request);
     }
 

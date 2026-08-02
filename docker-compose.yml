@@ -14,7 +14,7 @@ services:
       KEYCLOAK_ADMIN: admin
       KEYCLOAK_ADMIN_PASSWORD: admin
     ports:
-      - "8080:8080"
+      - "8081:8080"
     command: start-dev
     volumes:
       - .:/opt/jboss/keycloak/imports
@@ -74,12 +74,59 @@ services:
       - VIRTUAL_PORT=3307
     volumes:
       - inventorydb:/data/db
+  postgresMaintenance:
+    image: postgres:16
+    container_name: postgres-db
+    restart: unless-stopped
+    ports:
+      - "5431:5432"
+    environment:
+      POSTGRES_DB: turkcellMaintenanceDb
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: 12345
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+  postgresPayment:
+      image: postgres:16
+      container_name: postgres_payment
+      environment:
+        POSTGRES_USER: postgres
+        POSTGRES_PASSWORD: 12345
+        POSTGRES_DB: turkcell_paymentdb
+      ports:
+        - "5433:5432"
+      volumes:
+        - postgres_data:/var/lib/postgresql/data
+      restart: unless-stopped
+      healthcheck:
+        test: ["CMD-SHELL", "pg_isready -h localhost -U postgres -d turkcell_paymentdb"]
+        interval: 5s
+        timeout: 5s
+        retries: 10
+  postgresRental:
+    image: postgres:16
+    container_name: postgres_rental
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: 12345
+      POSTGRES_DB: turkcell_rentaldb
+    ports:
+      - "5434:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    restart: unless-stopped
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -h localhost -U postgres -d turkcell_rentaldb" ]
+      interval: 5s
+      timeout: 5s
+      retries: 10
 volumes:
   grafana_data:
   grafana_config:
   kafka_data:
   mongodb_data:
   inventorydb:
+  postgres_data:
 networks:
   monitor-net:
     driver: bridge

@@ -66,7 +66,6 @@ public class PaymentManager implements PaymentService {
         payment.setId(id);
         repository.save(payment);
         UpdatePaymentResponse response = mapper.forResponse().map(payment, UpdatePaymentResponse.class);
-
         return response;
     }
 

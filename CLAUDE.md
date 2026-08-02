@@ -168,7 +168,8 @@ cd common-package && ./mvnw install                        # Windows: .\mvnw.cmd
 
 # 2) Backing infrastructure only. No Spring Boot app is containerized; no Dockerfile exists.
 docker-compose up -d
-#   kafka 9092 · keycloak 8081 · zipkin 9411 · prometheus 9090 · grafana 3000
+#   kafka 9092 · kafka-ui 8090 (Kafbat UI, browses topics/messages/consumer groups)
+#   keycloak 8081 · zipkin 9411 · prometheus 9090 · grafana 3000
 #   mongo 27017 (filter) · mongo 27018 (invoice) · mysql 3307 (inventory)
 #   postgres 5431 (maintenance) · 5433 (payment) · 5434 (rental)
 
@@ -190,6 +191,8 @@ cd <module> && ./mvnw -q dependency:tree
 - **Turkish-locale JVM breaks gateway routing.** Under `tr-TR`, `lower-case-service-id: true` turns `INVENTORY-SERVICE` into `ınventory-servıce` (dotless `ı`) and every route 404s. Run `api-gateway` with `-Duser.language=en -Duser.country=US`.
 - **Do not remove `<classifier>exec</classifier>`** from `common-package/pom.xml`'s `spring-boot-maven-plugin`. It keeps the plain library jar under the default coordinates so the 6 business services can resolve it.
 - **All requests through the gateway are `/{service-id-lowercase}/...`** — e.g. `GET http://localhost:9010/inventory-service/api/cars`. There are no explicit route definitions.
+- **`kafka` has dual listeners.** `PLAINTEXT://localhost:9092` for the 10 host-run Spring apps; `INTERNAL://kafka:29092` for other containers (e.g. `kafka-ui`) reaching it over the Docker network by service name. Point any new containerized Kafka client at `kafka:29092`, not `localhost:9092`.
+- **`kafka`'s data volume must mount `/tmp/kraft-combined-logs`**, not `/opt/kafka/kafka-logs` — the `bashj79/kafka-kraft` image's actual log dir is the former regardless of what the folder naming implies. The wrong path silently no-ops the volume; the container looks persistent until `--force-recreate`, at which point all topics/offsets vanish with no error. Harmless here (Kafka is pure event transport, not a system of record — real state lives in each service's own DB), but confusing if unexpected.
 
 ---
 
@@ -311,7 +314,8 @@ Rules:
 
 **Keycloak OIDC resource server. There is no jwt, no `JwtAuthenticationFilter`, and no homegrown token code.**
 
-- Realm `RentACarMicroservice` at `localhost:8081` (the container maps host 8081 → container 8080). Realm roles: `user`, `admin`.
+- Realm `RentACarMicroservice` at `localhost:8081` (the container maps host 8081 → container 8080). Realm roles: `user`, `admin`. Test user `altananay` / `12345` has both roles; client `gateway-client` (public, direct access grants enabled) issues tokens via the password grant.
+- **`keycloak`'s data now persists** via the `keycloak_data:/opt/keycloak/data` volume (added after a container restart wiped the realm — Keycloak's `start-dev` H2 database lives in the container's writable layer by default, gone on any recreate unless that path is mounted). If the realm ever goes missing again despite the volume, check `docker volume ls` for `turkcell-rentacar-microservice_keycloak_data` and whether the container is actually mounting it.
 - One shared filter chain for every service: `common-package/src/main/java/com/kodlamaio/commonpackage/security/SecurityConfig.java`, annotated `@EnableMethodSecurity(securedEnabled = true)`. The `jwk-set-uri` comes from the external config repo.
 - `utils/security/KeycloakJwtRoleConverter` maps the `realm_access.roles` claim to `ROLE_<role>` authorities.
 - Matcher order — **first match wins**:

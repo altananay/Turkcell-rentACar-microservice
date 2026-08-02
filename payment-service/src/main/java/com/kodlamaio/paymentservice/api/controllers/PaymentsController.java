@@ -21,8 +21,8 @@ import java.util.UUID;
 @RestController
 @RequestMapping("/api/payments")
 public class PaymentsController {
-    private final PaymentService service;
 
+    private final PaymentService service;
 
     @GetMapping
     public List<GetAllPaymentsResponse> getAll() {
@@ -34,9 +34,14 @@ public class PaymentsController {
         return service.getById(id);
     }
     @PostMapping("/process-rental-payment")
-    public ClientResponse processRentalPayment(@RequestBody CreateRentalPaymentRequest request)
+    public ClientResponse processRentalPayment(@RequestHeader("Idempotency-Key") String idempotencyKey, @RequestBody CreateRentalPaymentRequest request)
     {
-        return service.processRentalPayment(request);
+        return service.processRentalPayment(idempotencyKey, request);
+    }
+    @PostMapping("/refund-rental-payment")
+    public ClientResponse refundRentalPayment(@RequestHeader("Idempotency-Key") String idempotencyKey, @RequestBody CreateRentalPaymentRequest request)
+    {
+        return service.refundRentalPayment(idempotencyKey, request);
     }
     @PostMapping
     @ResponseStatus(HttpStatus.CREATED)

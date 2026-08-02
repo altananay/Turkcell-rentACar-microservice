@@ -22,5 +22,6 @@ public interface PaymentService {
     UpdatePaymentResponse update(UUID id, UpdatePaymentRequest request);
 
     void delete(UUID id);
-    ClientResponse processRentalPayment(CreateRentalPaymentRequest request);
+    ClientResponse processRentalPayment(String idempotencyKey, CreateRentalPaymentRequest request);
+    ClientResponse refundRentalPayment(String idempotencyKey, CreateRentalPaymentRequest request);
 }

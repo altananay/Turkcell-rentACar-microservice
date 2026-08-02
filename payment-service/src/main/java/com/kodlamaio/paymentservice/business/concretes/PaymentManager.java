@@ -14,10 +14,15 @@ import com.kodlamaio.paymentservice.business.dto.responses.GetAllPaymentsRespons
 import com.kodlamaio.paymentservice.business.dto.responses.GetPaymentResponse;
 import com.kodlamaio.paymentservice.business.dto.responses.UpdatePaymentResponse;
 import com.kodlamaio.paymentservice.business.rules.PaymentBusinessRules;
+import com.kodlamaio.paymentservice.entity.OperationType;
 import com.kodlamaio.paymentservice.entity.Payment;
+import com.kodlamaio.paymentservice.entity.ProcessedPaymentOperation;
 import com.kodlamaio.paymentservice.repository.PaymentRepository;
+import com.kodlamaio.paymentservice.repository.ProcessedPaymentOperationRepository;
 import lombok.AllArgsConstructor;
+import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.support.TransactionTemplate;
 
 import java.util.List;
 import java.util.Optional;
@@ -30,6 +35,8 @@ public class PaymentManager implements PaymentService {
     private final ModelMapperService mapper;
     private final PosService posService;
     private final PaymentBusinessRules rules;
+    private final ProcessedPaymentOperationRepository processedOperationRepository;
+    private final TransactionTemplate transactionTemplate;
 
     @Override
     public List<GetAllPaymentsResponse> getAll() {
@@ -79,38 +86,112 @@ public class PaymentManager implements PaymentService {
     }
 
     @Override
-    public ClientResponse processRentalPayment(CreateRentalPaymentRequest request)
-    {
+    public ClientResponse processRentalPayment(String idempotencyKey, CreateRentalPaymentRequest request) {
+        var existing = processedOperationRepository.findByIdempotencyKeyAndOperationType(idempotencyKey, OperationType.CHARGE);
+        if (existing.isPresent()) {
+            return toClientResponse(existing.get());
+        }
+
         ClientResponse response = new ClientResponse();
-        validatePayment(request, response);
+        validatePayment(idempotencyKey, request, response);
         return response;
     }
 
-    private void validatePayment(CreateRentalPaymentRequest request, ClientResponse response)
-    {
-        try
-        {
+    @Override
+    public ClientResponse refundRentalPayment(String idempotencyKey, CreateRentalPaymentRequest request) {
+        var existing = processedOperationRepository.findByIdempotencyKeyAndOperationType(idempotencyKey, OperationType.REFUND);
+        if (existing.isPresent()) {
+            return toClientResponse(existing.get());
+        }
+
+        ClientResponse response = new ClientResponse();
+        processRefund(idempotencyKey, request, response);
+        return response;
+    }
+
+    private void validatePayment(String idempotencyKey, CreateRentalPaymentRequest request, ClientResponse response) {
+        try {
             rules.checkIfPaymentIsValid(request);
             Payment payment = Optional.ofNullable(repository.findByCardNumber(request.getCardNumber()))
                     .orElseThrow(() -> new BusinessException(Messages.Payment.NotFound));
 
-            rules.checkIfBalanceIsEnough(payment.getBalance(),request.getPrice());
+            rules.checkIfBalanceIsEnough(payment.getBalance(), request.getPrice());
             //FAKE POS SERVICE
             posService.pay();
 
-            processPayment(payment, request.getPrice());
+            var recorded = chargeAndRecord(idempotencyKey, payment, request.getPrice());
+            if (recorded.isEmpty()) {
+                var winner = processedOperationRepository
+                        .findByIdempotencyKeyAndOperationType(idempotencyKey, OperationType.CHARGE)
+                        .orElseThrow(() -> new BusinessException(Messages.Payment.NotFound));
+                response.setSuccess(winner.isSuccess());
+                response.setMessage(winner.getMessage());
+                return;
+            }
             response.setSuccess(true);
-        }
-        catch(Exception e)
-        {
+        } catch (Exception e) {
             response.setSuccess(false);
             response.setMessage(e.getMessage());
         }
     }
 
-    private void processPayment(Payment payment, double price)
-    {
-        payment.setBalance(payment.getBalance() - price);
-        repository.save(payment);
+    private Optional<ProcessedPaymentOperation> chargeAndRecord(String idempotencyKey, Payment payment, double price) {
+        try {
+            return Optional.of(transactionTemplate.execute(status -> {
+                payment.setBalance(payment.getBalance() - price);
+                repository.save(payment);
+                var operation = new ProcessedPaymentOperation();
+                operation.setIdempotencyKey(idempotencyKey);
+                operation.setOperationType(OperationType.CHARGE);
+                operation.setSuccess(true);
+                return processedOperationRepository.save(operation);
+            }));
+        } catch (DataIntegrityViolationException raceLoss) {
+            return Optional.empty();
+        }
+    }
+
+    private void processRefund(String idempotencyKey, CreateRentalPaymentRequest request, ClientResponse response) {
+        try {
+            Payment payment = Optional.ofNullable(repository.findByCardNumber(request.getCardNumber()))
+                    .orElseThrow(() -> new BusinessException(Messages.Payment.NotFound));
+
+            var recorded = refundAndRecord(idempotencyKey, payment, request.getPrice());
+            if (recorded.isEmpty()) {
+                var winner = processedOperationRepository
+                        .findByIdempotencyKeyAndOperationType(idempotencyKey, OperationType.REFUND)
+                        .orElseThrow(() -> new BusinessException(Messages.Payment.NotFound));
+                response.setSuccess(winner.isSuccess());
+                response.setMessage(winner.getMessage());
+                return;
+            }
+            response.setSuccess(true);
+        } catch (Exception e) {
+            response.setSuccess(false);
+            response.setMessage(e.getMessage());
+        }
+    }
+
+    private Optional<ProcessedPaymentOperation> refundAndRecord(String idempotencyKey, Payment payment, double price) {
+        try {
+            return Optional.of(transactionTemplate.execute(status -> {
+                payment.setBalance(payment.getBalance() + price);
+                repository.save(payment);
+                var operation = new ProcessedPaymentOperation();
+                operation.setIdempotencyKey(idempotencyKey);
+                operation.setOperationType(OperationType.REFUND);
+                operation.setSuccess(true);
+                return processedOperationRepository.save(operation);
+            }));
+        } catch (DataIntegrityViolationException raceLoss) {
+            return Optional.empty();
+        }
+    }
+
+    private ClientResponse toClientResponse(ProcessedPaymentOperation operation) {
+        var response = new ClientResponse();
+        response.setSuccess(operation.isSuccess());
+        response.setMessage(operation.getMessage());
+        return response;
     }
 }

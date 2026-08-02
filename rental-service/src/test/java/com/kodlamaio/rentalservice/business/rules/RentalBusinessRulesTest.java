@@ -1,10 +1,8 @@
 package com.kodlamaio.rentalservice.business.rules;
 
 import com.kodlamaio.commonpackage.utils.dto.ClientResponse;
-import com.kodlamaio.commonpackage.utils.dto.CreateRentalPaymentRequest;
 import com.kodlamaio.commonpackage.utils.exceptions.BusinessException;
 import com.kodlamaio.rentalservice.api.clients.CarClient;
-import com.kodlamaio.rentalservice.api.clients.PaymentClient;
 import com.kodlamaio.rentalservice.repository.RentalRepository;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
@@ -22,7 +20,6 @@ class RentalBusinessRulesTest {
 
     @Mock private RentalRepository repository;
     @Mock private CarClient carClient;
-    @Mock private PaymentClient paymentClient;
 
     @InjectMocks
     private RentalBusinessRules rules;
@@ -61,23 +58,5 @@ class RentalBusinessRulesTest {
         assertThatThrownBy(() -> rules.ensureCarIsAvailable(carId))
                 .isInstanceOf(BusinessException.class)
                 .hasMessage("some remote reason");
-    }
-
-    @Test
-    void ensurePaymentIsProcessed_whenPaymentClientReportsSuccess_doesNotThrow() {
-        var request = new CreateRentalPaymentRequest();
-        when(paymentClient.processRentalPayment(request)).thenReturn(new ClientResponse(true, null));
-
-        rules.ensurePaymentIsProcessed(request);
-    }
-
-    @Test
-    void ensurePaymentIsProcessed_whenPaymentClientReportsFailure_throwsWithRemoteMessage() {
-        var request = new CreateRentalPaymentRequest();
-        when(paymentClient.processRentalPayment(request)).thenReturn(new ClientResponse(false, "payment declined"));
-
-        assertThatThrownBy(() -> rules.ensurePaymentIsProcessed(request))
-                .isInstanceOf(BusinessException.class)
-                .hasMessage("payment declined");
     }
 }

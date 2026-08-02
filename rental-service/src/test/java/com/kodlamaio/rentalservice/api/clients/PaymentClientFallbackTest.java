@@ -12,7 +12,14 @@ class PaymentClientFallbackTest {
 
     @Test
     void processRentalPayment_alwaysThrowsBusinessException() {
-        assertThatThrownBy(() -> fallback.processRentalPayment(new CreateRentalPaymentRequest()))
+        assertThatThrownBy(() -> fallback.processRentalPayment("idempotency-key", new CreateRentalPaymentRequest()))
+                .isInstanceOf(BusinessException.class)
+                .hasMessage("PAYMENT DOWN");
+    }
+
+    @Test
+    void refundRentalPayment_alwaysThrowsBusinessException() {
+        assertThatThrownBy(() -> fallback.refundRentalPayment("idempotency-key", new CreateRentalPaymentRequest()))
                 .isInstanceOf(BusinessException.class)
                 .hasMessage("PAYMENT DOWN");
     }

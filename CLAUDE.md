@@ -139,6 +139,7 @@ Bootstrap for every business service:
 - Only `inventory-service` nests DTOs: `dto/requests/{create,update}` and `dto/responses/{create,get,update}`. Every other service uses flat `dto/requests` + `dto/responses`.
 - `payment-service` uses `entity` (singular) and adds `adapters/FakePosServiceAdapter` implementing `business/abstracts/PosService`.
 - `filter-service` base package is `kodlamaio.filterservice` — **no `com.` prefix**; its pom `groupId` is `kodlamaio`; it has no `business/rules` package and only response DTOs.
+- `rental-service` additionally has `business/saga/` (`RentalCreationSagaOrchestrator`, `SagaRecoveryScheduler`) — a deliberate deviation from the skeleton above, since a persisted state machine coordinating a `*Manager`, a Feign client, and Kafka publishing isn't a `*Manager` or `*BusinessRules`. See §12 for the saga itself.
 
 ---
 
@@ -149,7 +150,7 @@ Bootstrap for every business service:
 3. Services never import one another. Cross-service data crosses only via `commonpackage.utils.dto.*` (Feign) or `commonpackage.events.*` (Kafka).
 4. A type shared by two services goes in `common-package`, never duplicated. Adding one requires `cd common-package && ./mvnw install` before the consumer compiles.
 5. Inside a service: the controller depends on `business/abstracts/*Service`, never on `*Manager` directly. A `*Manager` owns exactly one repository. A `*BusinessRules` throws only `BusinessException`.
-6. Feign clients live in `api/clients` and are invoked from `business/rules` (precedent: `RentalBusinessRules.ensureCarIsAvailable`, `ensurePaymentIsProcessed`) or `business/concretes` — never from a controller.
+6. Feign clients live in `api/clients` and are invoked from `business/rules` (precedent: `RentalBusinessRules.ensureCarIsAvailable`) or `business/concretes`/`business/saga` (precedent: `RentalCreationSagaOrchestrator` calling `PaymentClient`/`CarClient`) — never from a controller.
 7. Kafka consumers live in `business/kafka/consumer` and delegate to the `*Service` interface — no direct repository access.
 8. Only `common-package` declares infrastructure dependencies. A service pom adds only its persistence starter + driver + `common-package` + test.
 9. Nothing `@Component`-scanned may live outside the two `scanBasePackages` roots.
@@ -354,12 +355,30 @@ Adding a topic requires: the event class in `common-package/events/<domain>/`, a
 | Client | Target | Endpoint | Resilience | Fallback throws |
 |---|---|---|---|---|
 | rental-service `CarClient` | inventory-service | `GET /api/cars/check-car-available/{carId}`, `GET /api/cars/get-car-for-invoice/{carId}` | `@Retry("rentalToInventory")` on `checkIfCarAvailable` only | `BusinessException` → 422 |
-| rental-service `PaymentClient` | payment-service | `POST /api/payments/process-rental-payment` | none | `BusinessException` → 422 |
-| maintenance-service `CarClient` | inventory-service | `GET /api/cars/check-car-available/{carId}` | `@Retry("maintenanceToInventory")` | `RuntimeException` → 500 (inconsistent — see §10) |
+| rental-service `PaymentClient` | payment-service | `POST /api/payments/process-rental-payment`, `POST /api/payments/refund-rental-payment` — both take a leading `Idempotency-Key` header | none | `BusinessException` → 422 |
+| maintenance-service `CarClient` | inventory-service | `GET /api/cars/check-car-available/{carId}` | `@Retry("maintenanceToInventory")` | `BusinessException` → 422 |
 
 Resilience4j is on the classpath via `common-package`, but there are **zero `@CircuitBreaker` annotations** and only the 2 `@Retry` above. All resilience4j YAML lives in the external config repo.
 
-`POST /api/rentals` is the heaviest flow: 3 synchronous hops (2× inventory, 1× payment) plus 2 Kafka publishes fanning out to 3 consumer services. Note that payment is debited *before* the rental row is saved and there is no compensating action — be careful when touching `RentalManager.add`.
+### `POST /api/rentals` — orchestration-based saga
+
+`RentalManager.add` no longer talks to `PaymentClient`/`CarClient` directly. It calls `rules.ensureCarIsAvailable(carId)` (read-only precondition), then delegates the whole rental-creation flow to `business/saga/RentalCreationSagaOrchestrator`, which persists a `RentalCreationSaga` row (`rental_creation_sagas` table, own Postgres) as the state machine and drives it through:
+
+```
+STARTED --charge succeeds--> PAYMENT_CHARGED --rental saved + saga COMPLETED--> COMPLETED
+   |                              |
+   +--charge fails--> PAYMENT_FAILED
+                                  +--anything after charge fails--> COMPENSATING --refund ok--> COMPENSATED
+                                                                          +--refund fails--> COMPENSATION_FAILED
+```
+
+- The saga row is self-contained (full card tuple + `carId`/`dailyPrice`/`rentedForDays`/`price`) so a crash mid-flow can resume from persisted state alone — the original in-memory request is gone.
+- `saga.getId()` is sent as the `Idempotency-Key` header on both `PaymentClient` calls. `payment-service` records every charge/refund in `processed_payment_operations` (unique on `idempotencyKey` + `operationType`) and replays the stored result on a repeat, so a retried charge or refund never double-executes.
+- Rental-row-save + saga-status-advance is one local `TransactionTemplate` transaction in rental-service; balance-mutate + idempotency-record-save is one local `TransactionTemplate` transaction in payment-service. **No transaction spans both services** — cross-service consistency is the saga's persisted state + compensation, never a transaction manager.
+- `business/saga/SagaRecoveryScheduler` (`@Scheduled(fixedDelay = 30000)`, needs `@EnableScheduling` on `RentalServiceApplication`) re-drives any saga stuck in `STARTED`/`PAYMENT_CHARGED`/`COMPENSATING` for >60s — this is what makes payment-before-save recoverable after a crash instead of silently leaking a charge.
+- Kafka publishing (`rental-created`, `rental-payment-created`) happens only after the local transaction commits, and is deliberately best-effort/fire-and-forget (same as everywhere else in this codebase) — a publish failure after commit is logged and swallowed, **never** triggers compensation on an already-successful rental.
+- Scope boundary: this saga guarantees payment ⇄ rental-row consistency only. It does not add a transactional outbox or touch downstream consumer idempotency (e.g. filter-service's raw Mongo insert on `car-created`).
+- `RentalCreationSaga`/`ProcessedPaymentOperation` both use `@Version` optimistic locking — a losing concurrent writer (a live request racing the recovery scheduler) gets `OptimisticLockingFailureException`, caught and treated as "someone else already handled this."
 
 ---
 
@@ -384,7 +403,9 @@ Resilience4j is on the classpath via `common-package`, but there are **zero `@Ci
 
 ## 14) Testing
 
-**Current state:** ~162 unit tests across `common-package` and all 6 business services, covering `*Manager`, `*BusinessRules`, `*Controller`, `*Consumer`, and `*ClientFallback` classes. All are plain Mockito/AssertJ unit tests or `MockMvcBuilders.standaloneSetup` controller tests — no `@SpringBootTest`, no Spring context, no config-server or database dependency. They pass with all backing infrastructure stopped. The old default `*ApplicationTests.java` `contextLoads()` stubs (one per module, Spring Initializr boilerplate) have been deleted — they required a live config-server/Keycloak to load the context and asserted nothing. `spring-security-test` is not declared anywhere; controller tests that need `@Valid` enforcement use `standaloneSetup`, which wires Bean Validation automatically without a security context.
+**Current state:** ~184 unit tests across `common-package` and all 6 business services, covering `*Manager`, `*BusinessRules`, `*Controller`, `*Consumer`, `*ClientFallback`, and (rental-service only) `business/saga/*` classes. All are plain Mockito/AssertJ unit tests or `MockMvcBuilders.standaloneSetup` controller tests — no `@SpringBootTest`, no Spring context, no config-server or database dependency. They pass with all backing infrastructure stopped. The old default `*ApplicationTests.java` `contextLoads()` stubs (one per module, Spring Initializr boilerplate) have been deleted — they required a live config-server/Keycloak to load the context and asserted nothing. `spring-security-test` is not declared anywhere; controller tests that need `@Valid` enforcement use `standaloneSetup`, which wires Bean Validation automatically without a security context.
+
+**Mockito pitfall hit while testing the saga (worth remembering):** re-stubbing a mock method with `when(mock.method(any())).thenX(...)` a second time, when the method's *first* stub was a side-effecting `thenAnswer(...)`, re-invokes that first Answer as a side effect of setting up the second stub — because `when(...)` has to actually call the mock method to record it, and `any()` evaluates to `null` at that call site. If the Answer dereferences its argument (e.g. `((Consumer) inv.getArgument(0)).accept(...)`), this NPEs during test setup, not during the real assertion. Fix: use `doThrow(...).when(mock).method(any())` (or `doAnswer`/`doReturn`) for the *second* stub — that syntax records the stub without re-triggering the currently active one.
 
 ### Standards
 
@@ -401,6 +422,8 @@ Resilience4j is on the classpath via `common-package`, but there are **zero `@Ci
 | `api/controllers/*Controller` | Status codes, `@Valid` rejection, `@Secured` | The `*Service` interface via `@MockBean`; use `@WebMvcTest` |
 | `api/clients/*ClientFallback` | That it throws the documented exception type | — |
 | `business/kafka/consumer/*Consumer` | Event maps to the right service call | The `*Service` interface |
+| `business/saga/RentalCreationSagaOrchestrator` | Every status transition, compensation, idempotent replay, optimistic-lock skip, post-commit Kafka isolation | Both repositories, `PaymentClient`, `CarClient`, `KafkaProducer`, `TransactionTemplate` (stub `executeWithoutResult`/`execute` to actually run the lambda) |
+| `business/saga/SagaRecoveryScheduler` | Correct recoverable-status query, one saga's failure doesn't block the batch | `RentalCreationSagaRepository`, `RentalCreationSagaOrchestrator` |
 
 ### Anti-patterns
 

@@ -1,0 +1,602 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Turkcell Rent-A-Car Microservices — Backend Audit</title>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid/dist/mermaid.min.js"></script>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; }
+    body { font-family: system-ui, sans-serif; margin: 0; background: #0d1117; color: #c9d1d9; line-height: 1.6; }
+    nav { position: sticky; top: 0; background: #161b22; border-bottom: 1px solid #30363d; padding: 0.75rem 1.5rem; display: flex; gap: 1.5rem; flex-wrap: wrap; z-index: 100; }
+    nav a { color: #58a6ff; text-decoration: none; font-size: 0.875rem; }
+    nav a:hover { text-decoration: underline; }
+    main { max-width: 1100px; margin: 0 auto; padding: 2rem 1.5rem; }
+    h1 { font-size: 1.75rem; border-bottom: 1px solid #30363d; padding-bottom: 0.5rem; }
+    h2 { font-size: 1.25rem; margin-top: 2.5rem; border-left: 3px solid #58a6ff; padding-left: 0.75rem; }
+    h3 { font-size: 1rem; color: #8b949e; }
+    table { width: 100%; border-collapse: collapse; margin: 1rem 0; font-size: 0.875rem; }
+    th { background: #161b22; color: #8b949e; text-align: left; padding: 0.5rem 0.75rem; border: 1px solid #30363d; }
+    td { padding: 0.5rem 0.75rem; border: 1px solid #30363d; vertical-align: top; }
+    tr:nth-child(even) { background: #161b22; }
+    .badge { display: inline-block; padding: 0.15rem 0.5rem; border-radius: 4px; font-size: 0.75rem; font-weight: 600; }
+    .high   { background: #3d1c1c; color: #f85149; }
+    .medium { background: #2d2008; color: #e3b341; }
+    .low    { background: #0d2216; color: #3fb950; }
+    .public    { background: #0d2216; color: #3fb950; }
+    .protected { background: #2d2008; color: #e3b341; }
+    .admin     { background: #3d1c1c; color: #f85149; }
+    .internal  { background: #1c2b3d; color: #58a6ff; }
+    .external  { background: #21262d; color: #8b949e; }
+    pre.mermaid { background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 1rem; overflow-x: auto; }
+    details summary { cursor: pointer; font-weight: 600; padding: 0.5rem 0; color: #58a6ff; }
+    details[open] summary { margin-bottom: 0.5rem; }
+    :focus-visible { outline: 2px solid #58a6ff; outline-offset: 2px; }
+    code { background: #161b22; padding: 0.1rem 0.35rem; border-radius: 4px; }
+    @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+  </style>
+</head>
+<body>
+  <nav aria-label="Report sections">
+    <a href="#summary">Summary</a>
+    <a href="#topology">Topology</a>
+    <a href="#shared">Shared Kernel</a>
+    <a href="#endpoints">Endpoints</a>
+    <a href="#auth">Auth</a>
+    <a href="#sync">Sync &amp; Resilience</a>
+    <a href="#events">Events</a>
+    <a href="#data">Data Layer</a>
+    <a href="#config">Config &amp; Deployment</a>
+    <a href="#observability">Observability</a>
+    <a href="#risks">Risk Matrix</a>
+    <a href="#handoff">Handoff Notes</a>
+  </nav>
+
+  <main>
+    <h1>Turkcell Rent-A-Car Microservices — Backend Audit</h1>
+    <p><strong>Repo:</strong> Turkcell-rentACar-microservice &nbsp;|&nbsp; <strong>Generated:</strong> 2026-08-02</p>
+
+    <section id="summary">
+      <h2>1. Executive Summary</h2>
+      <p>This is a 10-module Spring Boot microservices monorepo (Java 17, Spring Boot 3.0.6/3.1.0, Spring Cloud 2022.0.2) with no root/reactor pom — six independently deployable business services (inventory, rental, maintenance, payment, invoice, filter) sit behind a Spring Cloud Gateway, register with a single Eureka instance, pull runtime config from an external git-backed config-server, authenticate via a shared Keycloak-backed <code>SecurityConfig</code> in <code>common-package</code>, and choreograph state changes over 8 Kafka topics. Persistence is polyglot and strictly database-per-service (MySQL, 3&times; PostgreSQL, 2&times; MongoDB), with no SQL migration tooling anywhere &mdash; schema comes entirely from Hibernate <code>ddl-auto</code>.</p>
+      <p><strong>Overall risk posture: Medium.</strong> The core request/response and event-choreography paths are coherent and now have real unit-test coverage (38 test files, plain Mockito/<code>standaloneSetup</code>, zero live Spring context). The three highest-priority findings are: (1) the observability pipeline is silently non-functional &mdash; no <code>micrometer-registry-prometheus</code> dependency exists anywhere, so all 5 Prometheus scrape jobs are hitting endpoints that don't exist; (2) <code>RentalManager.add</code> debits a customer's payment via a synchronous Feign call <em>before</em> the local rental row is saved, with no compensating transaction if the save fails; and (3) every backing-service credential (Postgres, MySQL, Mongo, Keycloak admin) is committed in plaintext in <code>docker-compose.yml</code> with no <code>.env</code> indirection.</p>
+    </section>
+
+    <section id="topology">
+      <h2>2. Service Topology</h2>
+      <table>
+        <thead><tr><th>Module</th><th>Type</th><th>Boot parent</th><th>Maven wrapper</th><th>Local port</th><th>Datastore</th><th>Uses common-package</th></tr></thead>
+        <tbody>
+          <tr><td><code>config-server</code></td><td>Platform</td><td>3.0.6</td><td>3.9.1 / 3.2.0</td><td>8888</td><td>&mdash;</td><td>no</td></tr>
+          <tr><td><code>discovery-server</code></td><td>Platform</td><td>3.0.6</td><td>3.8.7 / 3.1.1</td><td>8761 <span class="badge external">Inferred</span></td><td>&mdash;</td><td>no</td></tr>
+          <tr><td><code>api-gateway</code></td><td>Platform</td><td>3.0.6</td><td>3.8.7 / 3.1.1</td><td>9010</td><td>&mdash;</td><td>no</td></tr>
+          <tr><td><code>common-package</code></td><td>Shared library</td><td>3.0.6</td><td>3.8.7 / 3.1.1</td><td>&mdash;</td><td>&mdash;</td><td>is</td></tr>
+          <tr><td><code>inventory-service</code></td><td>Business</td><td>3.0.6</td><td>3.9.2 / 3.2.0 (no license header)</td><td><span class="badge external">External</span></td><td>MySQL 3307</td><td>yes</td></tr>
+          <tr><td><code>rental-service</code></td><td>Business</td><td>3.0.6</td><td>3.8.7 / 3.1.1</td><td><span class="badge external">External</span></td><td>PostgreSQL 5434</td><td>yes</td></tr>
+          <tr><td><code>maintenance-service</code></td><td>Business</td><td><strong>3.1.0</strong></td><td>3.9.1 / 3.2.0</td><td><span class="badge external">External</span></td><td>PostgreSQL 5431</td><td>yes</td></tr>
+          <tr><td><code>payment-service</code></td><td>Business</td><td><strong>3.1.0</strong></td><td>3.8.7 / 3.1.1</td><td><span class="badge external">External</span></td><td>PostgreSQL 5433</td><td>yes</td></tr>
+          <tr><td><code>invoice-service</code></td><td>Business</td><td>3.0.6</td><td>3.9.1 / 3.2.0</td><td><span class="badge external">External</span></td><td>MongoDB 27018</td><td>yes</td></tr>
+          <tr><td><code>filter-service</code></td><td>Business</td><td>3.0.6</td><td>3.8.7 / 3.1.1</td><td><span class="badge external">External</span></td><td>MongoDB 27017</td><td>yes</td></tr>
+        </tbody>
+      </table>
+      <p><em>No root <code>pom.xml</code> exists &mdash; 10 independent modules, no reactor build. <code>common-package/pom.xml</code>'s <code>spring-boot-maven-plugin</code> sets <code>&lt;classifier&gt;exec&lt;/classifier&gt;</code> so the plain library jar stays resolvable by the 6 business services. Only 4 platform/library modules declare <code>spring-cloud.version</code>; the 6 business services inherit Spring Cloud transitively through <code>common-package</code>.</em></p>
+      <h3>Diagram D1 &mdash; Service Topology</h3>
+      <pre class="mermaid">
+graph LR
+  Client([Client])
+  subgraph Platform
+    GW[api-gateway :9010]
+    DISC[discovery-server :8761]
+    CFG[config-server :8888]
+    GIT[(github.com/altananay/config-server)]
+    KC[Keycloak :8081]
+  end
+  subgraph "Business Services"
+    INV[inventory-service]
+    RENT[rental-service]
+    MAINT[maintenance-service]
+    PAY[payment-service]
+    INVO[invoice-service]
+    FILT[filter-service]
+  end
+  subgraph Datastores
+    MYSQL[(MySQL :3307)]
+    PG1[(PostgreSQL :5434)]
+    PG2[(PostgreSQL :5431)]
+    PG3[(PostgreSQL :5433)]
+    MONGO1[(MongoDB :27018)]
+    MONGO2[(MongoDB :27017)]
+  end
+  Client --> GW
+  GW -->|/inventory-service/**| INV
+  GW -->|/rental-service/**| RENT
+  GW -->|/maintenance-service/**| MAINT
+  GW -->|/payment-service/**| PAY
+  GW -->|/invoice-service/**| INVO
+  GW -->|/filter-service/**| FILT
+  INV -.register.-> DISC
+  RENT -.register.-> DISC
+  MAINT -.register.-> DISC
+  PAY -.register.-> DISC
+  INVO -.register.-> DISC
+  FILT -.register.-> DISC
+  GW -.register.-> DISC
+  INV -.spring.config.import.-> CFG
+  RENT -.spring.config.import.-> CFG
+  MAINT -.spring.config.import.-> CFG
+  PAY -.spring.config.import.-> CFG
+  INVO -.spring.config.import.-> CFG
+  FILT -.spring.config.import.-> CFG
+  DISC -.spring.config.import.-> CFG
+  CFG --> GIT
+  INV --> MYSQL
+  RENT --> PG1
+  MAINT --> PG2
+  PAY --> PG3
+  INVO --> MONGO1
+  FILT --> MONGO2
+  INV -.jwk-set-uri.-> KC
+  RENT -.jwk-set-uri.-> KC
+  MAINT -.jwk-set-uri.-> KC
+  PAY -.jwk-set-uri.-> KC
+  INVO -.jwk-set-uri.-> KC
+  FILT -.jwk-set-uri.-> KC
+      </pre>
+    </section>
+
+    <section id="shared">
+      <h2>3. Shared Kernel (<code>common-package</code>)</h2>
+      <table>
+        <thead><tr><th>Class</th><th>Package</th><th>Purpose</th><th>Consumed by</th></tr></thead>
+        <tbody>
+          <tr><td><code>CommonPackageApplication</code></td><td>com.kodlamaio.commonpackage</td><td>Bootstrap class, sits in the exact scanned base package (inertly component-scanned everywhere)</td><td>all 6</td></tr>
+          <tr><td><code>SecurityConfig</code></td><td>.security</td><td>The one SecurityFilterChain for every service</td><td>all 6</td></tr>
+          <tr><td><code>KeycloakJwtRoleConverter</code></td><td>.utils.security</td><td>realm_access.roles &rarr; ROLE_&lt;role&gt;</td><td>all 6 (via SecurityConfig)</td></tr>
+          <tr><td><code>RestExceptionHandler</code></td><td>.configuration.exceptions</td><td>Global exception &rarr; HTTP status mapping</td><td>all 6</td></tr>
+          <tr><td><code>ModelMapperConfig</code></td><td>.configuration.mappers</td><td>ModelMapper + ModelMapperService beans</td><td>all 6</td></tr>
+          <tr><td><code>Messages</code></td><td>.utils.constants</td><td>Per-domain error-message-code constants</td><td>all 6</td></tr>
+          <tr><td><code>ExceptionTypes</code></td><td>.utils.constants</td><td>Exception-type string constants</td><td>RestExceptionHandler</td></tr>
+          <tr><td><code>Paths</code></td><td>.utils.constants</td><td>scanBasePackages constants</td><td>all 6</td></tr>
+          <tr><td><code>Regex</code></td><td>.utils.constants</td><td>Turkish plate regex</td><td>inventory-service</td></tr>
+          <tr><td><code>ClientResponse</code> / <code>CarClientResponse</code></td><td>.utils.dto</td><td>Feign result envelopes</td><td>rental, maintenance, payment, inventory</td></tr>
+          <tr><td><code>PaymentRequest</code> / <code>CreateRentalPaymentRequest</code></td><td>.utils.dto</td><td>Card payment DTOs with Bean Validation</td><td>payment, rental</td></tr>
+          <tr><td><code>BusinessException</code></td><td>.utils.exceptions</td><td>RuntimeException subclass</td><td>all 6</td></tr>
+          <tr><td><code>ModelMapperManager</code> / <code>ModelMapperService</code></td><td>.utils.mappers</td><td>forResponse()=LOOSE, forRequest()=STANDARD on one shared instance</td><td>all 6</td></tr>
+          <tr><td><code>ExceptionResult</code></td><td>.utils.results</td><td>{timestamp, type, message} error body</td><td>all 6</td></tr>
+          <tr><td><code>NotFutureYear</code> / Validator</td><td>.utils.annotations</td><td>Custom Bean Validation constraint</td><td>inventory-service</td></tr>
+          <tr><td>8 event classes + <code>Event</code> marker</td><td>.events.*</td><td>Kafka payload DTOs</td><td>inventory, rental, maintenance, filter, invoice</td></tr>
+          <tr><td><code>KafkaProducer</code></td><td>.kafka.producer</td><td>sendMessage(T event, String topic)</td><td>inventory, rental, maintenance</td></tr>
+        </tbody>
+      </table>
+      <h3>Inherited dependency surface</h3>
+      <table>
+        <thead><tr><th>Dependency</th><th>What it enables everywhere</th></tr></thead>
+        <tbody>
+          <tr><td>spring-boot-starter-web</td><td>Full Spring MVC stack, even in modules that don't declare it themselves</td></tr>
+          <tr><td>spring-boot-starter-oauth2-resource-server</td><td>JWT validation used by SecurityConfig</td></tr>
+          <tr><td>spring-cloud-starter-netflix-eureka-client</td><td>@EnableDiscoveryClient registration</td></tr>
+          <tr><td>spring-cloud-starter-openfeign</td><td>@FeignClient support (rental, maintenance, payment)</td></tr>
+          <tr><td>spring-cloud-starter-circuitbreaker-resilience4j</td><td>On classpath everywhere &mdash; but zero @CircuitBreaker usages, see Risk Matrix</td></tr>
+          <tr><td>spring-kafka</td><td>KafkaTemplate / @KafkaListener</td></tr>
+          <tr><td>micrometer-tracing-bridge-brave, zipkin-reporter-brave, actuator</td><td>Tracing + actuator &mdash; but not micrometer-registry-prometheus, see Risk Matrix</td></tr>
+        </tbody>
+      </table>
+      <p><em><code>common-package/src/main/resources/application.properties</code> is empty &mdash; the module ships no configuration of its own.</em></p>
+    </section>
+
+    <section id="endpoints">
+      <h2>4. Endpoint Inventory</h2>
+
+      <details open>
+        <summary>inventory-service &mdash; BrandsController (/api/brands)</summary>
+        <table>
+          <thead><tr><th>Method</th><th>Path</th><th>Gateway path</th><th>Auth</th><th>@Valid</th><th>Req DTO</th><th>Res DTO</th><th>Status</th></tr></thead>
+          <tbody>
+            <tr><td>GET</td><td>/api/brands</td><td>/inventory-service/api/brands</td><td><span class="badge public">Public</span></td><td>&mdash;</td><td>&mdash;</td><td>GetAllBrandsResponse</td><td>200</td></tr>
+            <tr><td>GET</td><td>/api/brands/{id}</td><td>/inventory-service/api/brands/{id}</td><td><span class="badge protected">Role:user</span></td><td>&mdash;</td><td>&mdash;</td><td>GetBrandResponse</td><td>200</td></tr>
+            <tr><td>POST</td><td>/api/brands</td><td>/inventory-service/api/brands</td><td><span class="badge protected">Role:user</span></td><td>yes</td><td>CreateBrandRequest</td><td>CreateBrandResponse</td><td>201</td></tr>
+            <tr><td>PUT</td><td>/api/brands/{id}</td><td>/inventory-service/api/brands/{id}</td><td><span class="badge protected">Role:user</span></td><td>yes</td><td>UpdateBrandRequest</td><td>UpdateBrandResponse</td><td>200</td></tr>
+            <tr><td>DELETE</td><td>/api/brands/{id}</td><td>/inventory-service/api/brands/{id}</td><td><span class="badge protected">Role:user</span></td><td>&mdash;</td><td>&mdash;</td><td>&mdash;</td><td>204</td></tr>
+          </tbody>
+        </table>
+      </details>
+
+      <details>
+        <summary>inventory-service &mdash; CarsController (/api/cars)</summary>
+        <table>
+          <thead><tr><th>Method</th><th>Path</th><th>Gateway path</th><th>Auth</th><th>@Valid</th><th>Req DTO</th><th>Res DTO</th><th>Status</th></tr></thead>
+          <tbody>
+            <tr><td>GET</td><td>/api/cars</td><td>/inventory-service/api/cars</td><td><span class="badge admin">Public + ROLE_admin</span></td><td>&mdash;</td><td>&mdash;</td><td>GetAllCarsResponse</td><td>200</td></tr>
+            <tr><td>GET</td><td>/api/cars/{id}</td><td>/inventory-service/api/cars/{id}</td><td><span class="badge public">Public</span></td><td>&mdash;</td><td>&mdash;</td><td>GetCarResponse</td><td>200</td></tr>
+            <tr><td>POST</td><td>/api/cars</td><td>/inventory-service/api/cars</td><td><span class="badge public">Public</span></td><td>yes</td><td>CreateCarRequest</td><td>CreateCarResponse</td><td>201</td></tr>
+            <tr><td>PUT</td><td>/api/cars/{id}</td><td>/inventory-service/api/cars/{id}</td><td><span class="badge public">Public</span></td><td>yes</td><td>UpdateCarRequest</td><td>UpdateCarResponse</td><td>200</td></tr>
+            <tr><td>DELETE</td><td>/api/cars/{id}</td><td>/inventory-service/api/cars/{id}</td><td><span class="badge public">Public</span></td><td>&mdash;</td><td>&mdash;</td><td>&mdash;</td><td>204</td></tr>
+            <tr><td>GET</td><td>/api/cars/check-car-available/{id}</td><td>/inventory-service/api/cars/check-car-available/{id}</td><td><span class="badge internal">Public / Internal</span></td><td>&mdash;</td><td>&mdash;</td><td>ClientResponse</td><td>200</td></tr>
+            <tr><td>GET</td><td>/api/cars/get-car-for-invoice/{carId}</td><td>/inventory-service/api/cars/get-car-for-invoice/{carId}</td><td><span class="badge internal">Public / Internal</span></td><td>&mdash;</td><td>&mdash;</td><td>CarClientResponse</td><td>200</td></tr>
+          </tbody>
+        </table>
+        <p><em><code>@Secured("ROLE_admin")</code> on <code>getAll</code> is the only method-level security annotation in the repo &mdash; it gates the endpoint despite the URL-level matcher being permitAll.</em></p>
+      </details>
+
+      <details>
+        <summary>inventory-service &mdash; ModelsController (/api/models)</summary>
+        <table>
+          <thead><tr><th>Method</th><th>Path</th><th>Gateway path</th><th>Auth</th><th>@Valid</th><th>Req DTO</th><th>Res DTO</th><th>Status</th></tr></thead>
+          <tbody>
+            <tr><td>GET</td><td>/api/models</td><td>/inventory-service/api/models</td><td><span class="badge protected">Role:user</span></td><td>&mdash;</td><td>&mdash;</td><td>GetAllModelsResponse</td><td>200</td></tr>
+            <tr><td>GET</td><td>/api/models/{id}</td><td>/inventory-service/api/models/{id}</td><td><span class="badge protected">Role:user</span></td><td>&mdash;</td><td>&mdash;</td><td>GetModelResponse</td><td>200</td></tr>
+            <tr><td>POST</td><td>/api/models</td><td>/inventory-service/api/models</td><td><span class="badge protected">Role:user</span></td><td>yes</td><td>CreateModelRequest</td><td>CreateModelResponse</td><td>201</td></tr>
+            <tr><td>PUT</td><td>/api/models/{id}</td><td>/inventory-service/api/models/{id}</td><td><span class="badge protected">Role:user</span></td><td>yes</td><td>UpdateModelRequest</td><td>UpdateModelResponse</td><td>200</td></tr>
+            <tr><td>DELETE</td><td>/api/models/{id}</td><td>/inventory-service/api/models/{id}</td><td><span class="badge protected">Role:user</span></td><td>&mdash;</td><td>&mdash;</td><td>&mdash;</td><td>204</td></tr>
+          </tbody>
+        </table>
+      </details>
+
+      <details>
+        <summary>rental-service &mdash; RentalsController (/api/rentals)</summary>
+        <table>
+          <thead><tr><th>Method</th><th>Path</th><th>Gateway path</th><th>Auth</th><th>@Valid</th><th>Req DTO</th><th>Res DTO</th><th>Status</th></tr></thead>
+          <tbody>
+            <tr><td>GET</td><td>/api/rentals</td><td>/rental-service/api/rentals</td><td><span class="badge protected">Role:user</span></td><td>&mdash;</td><td>&mdash;</td><td>GetAllRentalsResponse</td><td>200</td></tr>
+            <tr><td>GET</td><td>/api/rentals/{id}</td><td>/rental-service/api/rentals/{id}</td><td><span class="badge protected">Role:user</span></td><td>&mdash;</td><td>&mdash;</td><td>GetRentalResponse</td><td>200</td></tr>
+            <tr><td>POST</td><td>/api/rentals</td><td>/rental-service/api/rentals</td><td><span class="badge protected">Role:user</span></td><td>yes</td><td>CreateRentalRequest</td><td>CreateRentalResponse</td><td>201</td></tr>
+            <tr><td>PUT</td><td>/api/rentals/{id}</td><td>/rental-service/api/rentals/{id}</td><td><span class="badge protected">Role:user</span></td><td>yes</td><td>UpdateRentalRequest</td><td>UpdateRentalResponse</td><td>200</td></tr>
+            <tr><td>DELETE</td><td>/api/rentals/{id}</td><td>/rental-service/api/rentals/{id}</td><td><span class="badge protected">Role:user</span></td><td>&mdash;</td><td>&mdash;</td><td>&mdash;</td><td>204</td></tr>
+          </tbody>
+        </table>
+      </details>
+
+      <details>
+        <summary>maintenance-service &mdash; MaintenancesController (/api/maintenances)</summary>
+        <table>
+          <thead><tr><th>Method</th><th>Path</th><th>Gateway path</th><th>Auth</th><th>@Valid</th><th>Req DTO</th><th>Res DTO</th><th>Status</th></tr></thead>
+          <tbody>
+            <tr><td>GET</td><td>/api/maintenances</td><td>/maintenance-service/api/maintenances</td><td><span class="badge protected">Role:user</span></td><td>&mdash;</td><td>&mdash;</td><td>GetAllMaintenancesResponse</td><td>200</td></tr>
+            <tr><td>GET</td><td>/api/maintenances/{id}</td><td>/maintenance-service/api/maintenances/{id}</td><td><span class="badge protected">Role:user</span></td><td>&mdash;</td><td>&mdash;</td><td>GetMaintenanceResponse</td><td>200</td></tr>
+            <tr><td>POST</td><td>/api/maintenances</td><td>/maintenance-service/api/maintenances</td><td><span class="badge protected">Role:user</span></td><td>yes</td><td>CreateMaintenanceRequest</td><td>CreateMaintenanceResponse</td><td>201</td></tr>
+            <tr><td>PUT</td><td>/api/maintenances/{id}</td><td>/maintenance-service/api/maintenances/{id}</td><td><span class="badge protected">Role:user</span></td><td>yes</td><td>UpdateMaintenanceRequest</td><td>UpdateMaintenanceResponse</td><td>200</td></tr>
+            <tr><td>DELETE</td><td>/api/maintenances/{id}</td><td>/maintenance-service/api/maintenances/{id}</td><td><span class="badge protected">Role:user</span></td><td>&mdash;</td><td>&mdash;</td><td>&mdash;</td><td>204</td></tr>
+          </tbody>
+        </table>
+      </details>
+
+      <details>
+        <summary>payment-service &mdash; PaymentsController (/api/payments)</summary>
+        <table>
+          <thead><tr><th>Method</th><th>Path</th><th>Gateway path</th><th>Auth</th><th>@Valid</th><th>Req DTO</th><th>Res DTO</th><th>Status</th></tr></thead>
+          <tbody>
+            <tr><td>GET</td><td>/api/payments</td><td>/payment-service/api/payments</td><td><span class="badge protected">Role:user</span></td><td>&mdash;</td><td>&mdash;</td><td>GetAllPaymentsResponse</td><td>200</td></tr>
+            <tr><td>GET</td><td>/api/payments/{id}</td><td>/payment-service/api/payments/{id}</td><td><span class="badge protected">Role:user</span></td><td>&mdash;</td><td>&mdash;</td><td>GetPaymentResponse</td><td>200</td></tr>
+            <tr><td>POST</td><td>/api/payments/process-rental-payment</td><td>/payment-service/api/payments/process-rental-payment</td><td><span class="badge internal">Internal (Feign only)</span></td><td><strong>no</strong></td><td>CreateRentalPaymentRequest</td><td>ClientResponse</td><td>200</td></tr>
+            <tr><td>POST</td><td>/api/payments</td><td>/payment-service/api/payments</td><td><span class="badge protected">Role:user</span></td><td>yes</td><td>CreatePaymentRequest</td><td>CreatePaymentResponse</td><td>201</td></tr>
+            <tr><td>PUT</td><td>/api/payments/{id}</td><td>/payment-service/api/payments/{id}</td><td><span class="badge protected">Role:user</span></td><td>yes</td><td>UpdatePaymentRequest</td><td>UpdatePaymentResponse</td><td>200</td></tr>
+            <tr><td>DELETE</td><td>/api/payments/{id}</td><td>/payment-service/api/payments/{id}</td><td><span class="badge protected">Role:user</span></td><td>&mdash;</td><td>&mdash;</td><td>&mdash;</td><td>204</td></tr>
+          </tbody>
+        </table>
+      </details>
+
+      <details>
+        <summary>invoice-service &mdash; InvoicesController (/api/invoices)</summary>
+        <table>
+          <thead><tr><th>Method</th><th>Path</th><th>Gateway path</th><th>Auth</th><th>@Valid</th><th>Req DTO</th><th>Res DTO</th><th>Status</th></tr></thead>
+          <tbody>
+            <tr><td>GET</td><td>/api/invoices</td><td>/invoice-service/api/invoices</td><td><span class="badge protected">Role:user</span></td><td>&mdash;</td><td>&mdash;</td><td>GetAllInvoicesResponse</td><td>200</td></tr>
+          </tbody>
+        </table>
+        <p><em>Only handler in the controller &mdash; getById/add and their DTOs are unreachable over HTTP; add is invoked only from invoice-service's Kafka consumer.</em></p>
+      </details>
+
+      <details>
+        <summary>filter-service &mdash; FiltersController (/api/filters)</summary>
+        <table>
+          <thead><tr><th>Method</th><th>Path</th><th>Gateway path</th><th>Auth</th><th>@Valid</th><th>Req DTO</th><th>Res DTO</th><th>Status</th></tr></thead>
+          <tbody>
+            <tr><td>GET</td><td>/api/filters</td><td>/filter-service/api/filters</td><td><span class="badge public">Public</span></td><td>&mdash;</td><td>&mdash;</td><td>GetAllFiltersResponse</td><td>200</td></tr>
+            <tr><td>GET</td><td>/api/filters/{id}</td><td>/filter-service/api/filters/{id}</td><td><span class="badge public">Public</span></td><td>&mdash;</td><td>&mdash;</td><td>GetFilterResponse</td><td>200</td></tr>
+          </tbody>
+        </table>
+        <p><em><code>getById</code> takes a <code>String id</code>, not <code>UUID</code> &mdash; the only controller in the repo with a string path variable.</em></p>
+      </details>
+    </section>
+
+    <section id="auth">
+      <h2>5. Auth &amp; Authorisation Model</h2>
+      <h3>Diagram D4 &mdash; Token validation</h3>
+      <pre class="mermaid">
+sequenceDiagram
+  participant Client
+  participant Keycloak
+  participant Gateway as api-gateway
+  participant Chain as SecurityConfig filterChain
+  participant Converter as KeycloakJwtRoleConverter
+  participant Controller as inventory-service/CarsController
+  Client->>Keycloak: POST /realms/RentACarMicroservice/protocol/openid-connect/token
+  Keycloak-->>Client: access_token (JWT, realm_access.roles)
+  Client->>Gateway: Request + Authorization: Bearer JWT
+  Note over Gateway: Gateway does not validate the token
+  Gateway->>Chain: forwarded request
+  Chain->>Chain: oauth2ResourceServer().jwt() - jwk-set-uri (External)
+  Chain->>Converter: convert(Jwt)
+  Converter-->>Chain: realm_access.roles -> ROLE_role authorities
+  Chain->>Chain: permitAll / hasAnyRole(user) / authenticated, first match wins
+  Chain->>Controller: @Secured(ROLE_admin) checked only on CarsController#getAll
+      </pre>
+      <h3>Matcher order (as declared, SecurityConfig.java:22-33)</h3>
+      <table>
+        <thead><tr><th>#</th><th>Matcher</th><th>Rule</th><th>Notes</th></tr></thead>
+        <tbody>
+          <tr><td>1</td><td><code>/api/filters</code></td><td>permitAll</td><td>filter-service getAll</td></tr>
+          <tr><td>2</td><td><code>/api/cars/check-car-available/**</code></td><td>permitAll</td><td>subsumed by #4</td></tr>
+          <tr><td>3</td><td><code>/api/payments/check</code></td><td>permitAll</td><td>dead rule &mdash; no controller maps it</td></tr>
+          <tr><td>4</td><td><code>/api/cars</code></td><td>permitAll</td><td>exact match</td></tr>
+          <tr><td>5</td><td><code>/api/cars/**</code></td><td>permitAll</td><td>covers getAll at HTTP layer; method security still gates it</td></tr>
+          <tr><td>6</td><td><code>/actuator/**</code></td><td>permitAll</td><td>every service's actuator is unauthenticated</td></tr>
+          <tr><td>7</td><td><code>/api/**</code></td><td>hasAnyRole("user")</td><td>catch-all for brands/models/rentals/maintenances/payments/invoices</td></tr>
+          <tr><td>8</td><td>anyRequest</td><td>authenticated()</td><td>final catch-all</td></tr>
+        </tbody>
+      </table>
+      <h3>Role model</h3>
+      <table>
+        <thead><tr><th>Role</th><th>Reachable paths</th><th>Notes</th></tr></thead>
+        <tbody>
+          <tr><td>Anonymous</td><td>filters, check-car-available, cars (list/CRUD), actuator</td><td>Car list is URL-permitAll but method-gated to ROLE_admin</td></tr>
+          <tr><td><code>user</code></td><td>Everything else under /api/**</td><td>Via hasAnyRole("user")</td></tr>
+          <tr><td><code>admin</code></td><td>user paths + CarsController#getAll</td><td>Only @Secured usage in the repo</td></tr>
+        </tbody>
+      </table>
+      <p><em>The gateway does not authenticate &mdash; it doesn't depend on common-package (which would pull spring-boot-starter-web into the WebFlux app). Every service validates its own token independently.</em></p>
+    </section>
+
+    <section id="sync">
+      <h2>6. Synchronous Call Graph &amp; Resilience</h2>
+      <table>
+        <thead><tr><th>Client</th><th>Declared in</th><th>Target</th><th>Endpoint(s)</th><th>Retry/CB</th><th>Fallback</th><th>Throws</th><th>Status</th></tr></thead>
+        <tbody>
+          <tr><td>CarClient</td><td>rental-service</td><td>inventory-service</td><td>check-car-available, get-car-for-invoice</td><td>@Retry("rentalToInventory") on checkIfCarAvailable only</td><td>CarClientFallback</td><td>BusinessException</td><td>422</td></tr>
+          <tr><td>PaymentClient</td><td>rental-service</td><td>payment-service</td><td>process-rental-payment</td><td>none</td><td>PaymentClientFallback</td><td>BusinessException("PAYMENT DOWN")</td><td>422</td></tr>
+          <tr><td>CarClient</td><td>maintenance-service</td><td>inventory-service</td><td>check-car-available</td><td>@Retry("maintenanceToInventory")</td><td>CarClientFallback</td><td>BusinessException</td><td>422</td></tr>
+        </tbody>
+      </table>
+      <p><em>Zero <code>@CircuitBreaker</code> annotations anywhere despite resilience4j on the classpath. Only 2 of 4 Feign methods carry <code>@Retry</code>. All three fallbacks now throw <code>BusinessException</code> consistently &mdash; maintenance-service's was previously a bare <code>RuntimeException</code> (500) and has been aligned to 422 this session.</em></p>
+      <h3>Diagram D3 &mdash; POST /api/rentals end to end</h3>
+      <pre class="mermaid">
+sequenceDiagram
+  participant Client
+  participant GW as api-gateway
+  participant C as rental-service/RentalsController
+  participant M as rental-service/RentalManager
+  participant R as rental-service/RentalBusinessRules
+  participant CC as rental-service/CarClient
+  participant Inv as inventory-service
+  participant PC as rental-service/PaymentClient
+  participant Pay as payment-service/PaymentManager
+  participant Pos as payment-service/FakePosServiceAdapter
+  participant DB as PostgreSQL :5434
+  participant K as KafkaProducer
+  participant InvC as inventory-service/RentalConsumer
+  participant FiltC as filter-service/RentalConsumer
+  participant InvoC as invoice-service/RentalConsumer
+  Client->>GW: POST /rental-service/api/rentals
+  GW->>C: forwarded
+  C->>M: add(CreateRentalRequest)
+  M->>R: ensureCarIsAvailable(carId)
+  R->>CC: checkIfCarAvailable(carId)
+  CC->>Inv: GET /api/cars/check-car-available/carId
+  Inv-->>CC: ClientResponse
+  M->>M: map request to Rental, setTotalPrice, setRentedAt
+  M->>R: ensurePaymentIsProcessed(paymentRequest)
+  R->>PC: processRentalPayment(request)
+  PC->>Pay: POST /api/payments/process-rental-payment
+  Pay->>Pos: pay() fake POS
+  Pay-->>PC: ClientResponse
+  M->>CC: getCar(carId)
+  CC->>Inv: GET /api/cars/get-car-for-invoice/carId
+  M->>DB: repository.save(rental)
+  M->>K: sendMessage(RentalCreatedEvent, rental-created)
+  K-->>InvC: rental-created
+  K-->>FiltC: rental-created
+  M->>K: sendMessage(RentalPaymentCreatedEvent, rental-payment-created)
+  K-->>InvoC: rental-payment-created
+  Note over M,Pay: Payment is debited BEFORE the rental row is saved.<br/>No outbox, no compensation if save or publish fails after payment succeeds.
+      </pre>
+    </section>
+
+    <section id="events">
+      <h2>7. Event Choreography (Kafka)</h2>
+      <table>
+        <thead><tr><th>Topic</th><th>Event class</th><th>Producer</th><th>Consumers (groupId)</th></tr></thead>
+        <tbody>
+          <tr><td><code>car-created</code></td><td>CarCreatedEvent</td><td>inventory/CarManager:120</td><td>filter/InventoryConsumer (car-create)</td></tr>
+          <tr><td><code>car-deleted</code></td><td>CarDeletedEvent</td><td>inventory/CarManager:125</td><td>filter/InventoryConsumer (car-delete)</td></tr>
+          <tr><td><code>brand-deleted</code></td><td>BrandDeletedEvent</td><td>inventory/BrandManager:73</td><td>filter/InventoryConsumer (brand-delete)</td></tr>
+          <tr><td><code>maintenance-created</code></td><td>MaintenanceCreatedEvent</td><td>maintenance/MaintenanceManager:95</td><td>filter/MaintenanceConsumer (filter-maintenance-create), inventory/MaintenanceConsumer (inventory-maintenance-create)</td></tr>
+          <tr><td><code>maintenance-deleted</code></td><td>MaintenanceDeletedEvent</td><td>maintenance/MaintenanceManager:100</td><td>filter/MaintenanceConsumer (filter-maintenance-delete), inventory/MaintenanceConsumer (inventory-maintenance-delete)</td></tr>
+          <tr><td><code>rental-created</code></td><td>RentalCreatedEvent</td><td>rental/RentalManager:109</td><td>filter/RentalConsumer (filter-rental-create), inventory/RentalConsumer (inventory-rental-create)</td></tr>
+          <tr><td><code>rental-payment-created</code></td><td>RentalPaymentCreatedEvent</td><td>rental/RentalManager:114</td><td>invoice/RentalConsumer (rental-payment-create)</td></tr>
+          <tr><td><code>rental-deleted</code></td><td>RentalDeletedEvent</td><td>rental/RentalManager:119</td><td>filter/RentalConsumer (filter-rental-delete), inventory/RentalConsumer (inventory-rental-delete)</td></tr>
+        </tbody>
+      </table>
+      <p><em>Topic names are hardcoded string literals &mdash; no constants class. filter-service's 4 update consumers now guard <code>service.getByCarId(...)</code> with <code>Objects.isNull</code> and log-and-skip; the car-created handler needs no such guard since it always creates a new document.</em></p>
+      <h3>Diagram D2 &mdash; Event choreography</h3>
+      <pre class="mermaid">
+graph LR
+  CarManager[inventory-service/CarManager]
+  BrandManager[inventory-service/BrandManager]
+  MaintManager[maintenance-service/MaintenanceManager]
+  RentManager[rental-service/RentalManager]
+
+  T1((car-created))
+  T2((car-deleted))
+  T3((brand-deleted))
+  T4((maintenance-created))
+  T5((maintenance-deleted))
+  T6((rental-created))
+  T7((rental-payment-created))
+  T8((rental-deleted))
+
+  FiltInv[filter-service/InventoryConsumer]
+  FiltMaint[filter-service/MaintenanceConsumer]
+  FiltRent[filter-service/RentalConsumer]
+  InvMaint[inventory-service/MaintenanceConsumer]
+  InvRent[inventory-service/RentalConsumer]
+  InvoRent[invoice-service/RentalConsumer]
+
+  CarManager --> T1
+  CarManager --> T2
+  BrandManager --> T3
+  MaintManager --> T4
+  MaintManager --> T5
+  RentManager --> T6
+  RentManager --> T7
+  RentManager --> T8
+
+  T1 -->|car-create| FiltInv
+  T2 -->|car-delete| FiltInv
+  T3 -->|brand-delete| FiltInv
+  T4 -->|filter-maintenance-create| FiltMaint
+  T4 -->|inventory-maintenance-create| InvMaint
+  T5 -->|filter-maintenance-delete| FiltMaint
+  T5 -->|inventory-maintenance-delete| InvMaint
+  T6 -->|filter-rental-create| FiltRent
+  T6 -->|inventory-rental-create| InvRent
+  T7 -->|rental-payment-create| InvoRent
+  T8 -->|filter-rental-delete| FiltRent
+  T8 -->|inventory-rental-delete| InvRent
+      </pre>
+    </section>
+
+    <section id="data">
+      <h2>8. Data Layer &amp; Ownership</h2>
+      <table>
+        <thead><tr><th>Service</th><th>Engine</th><th>Port</th><th>Repository base</th><th>Entities/documents</th></tr></thead>
+        <tbody>
+          <tr><td>inventory-service</td><td>MySQL</td><td>3307</td><td>JpaRepository</td><td>Brand, Model, Car, State enum</td></tr>
+          <tr><td>rental-service</td><td>PostgreSQL</td><td>5434</td><td>JpaRepository</td><td>Rental</td></tr>
+          <tr><td>maintenance-service</td><td>PostgreSQL</td><td>5431</td><td>JpaRepository</td><td>Maintenance</td></tr>
+          <tr><td>payment-service</td><td>PostgreSQL</td><td>5433</td><td>JpaRepository</td><td>Payment (singular entity package)</td></tr>
+          <tr><td>invoice-service</td><td>MongoDB</td><td>27018</td><td>MongoRepository</td><td>Invoice</td></tr>
+          <tr><td>filter-service</td><td>MongoDB</td><td>27017</td><td>MongoRepository</td><td>Filter</td></tr>
+        </tbody>
+      </table>
+      <details open>
+        <summary>inventory-service &mdash; schema detail (only service with JPA relationships)</summary>
+        <table>
+          <thead><tr><th>Table</th><th>Field</th><th>Type</th><th>Constraints</th></tr></thead>
+          <tbody>
+            <tr><td>brands</td><td>id</td><td>UUID</td><td>@Id @GeneratedValue</td></tr>
+            <tr><td>brands</td><td>models</td><td>List&lt;Model&gt;</td><td>@OneToMany(mappedBy=brand, cascade=ALL)</td></tr>
+            <tr><td>models</td><td>brand</td><td>Brand</td><td>@ManyToOne @JoinColumn(brand_id)</td></tr>
+            <tr><td>models</td><td>cars</td><td>List&lt;Car&gt;</td><td>@OneToMany(mappedBy=model, cascade=ALL)</td></tr>
+            <tr><td>cars</td><td>state</td><td>State enum</td><td>@Enumerated(STRING)</td></tr>
+            <tr><td>cars</td><td>model</td><td>Model</td><td>@ManyToOne @JoinColumn(model_id)</td></tr>
+          </tbody>
+        </table>
+        <p><em>Custom query: CarRepository.changeStateByCarId &mdash; @Modifying @Transactional @Query update.</em></p>
+      </details>
+      <details>
+        <summary>rental / maintenance / payment &mdash; schema detail</summary>
+        <table>
+          <thead><tr><th>Table</th><th>Fields</th><th>Notes</th></tr></thead>
+          <tbody>
+            <tr><td>rentals</td><td>id, carId, dailyPrice, totalPrice, rentedForDays, rentedAt</td><td>carId is a plain column, no FK to inventory</td></tr>
+            <tr><td>maintenances</td><td>id, carId, information, isCompleted, startDate, endDate</td><td>findMaintenanceByCarIdAndIsCompletedFalse, existsByCarIdAndIsCompletedIsFalse</td></tr>
+            <tr><td>payments</td><td>id, cardNumber, cardHolder, cardExpirationYear/Month, cardCvv, balance</td><td>findByCardNumber, existsByCardNumber(+full match)</td></tr>
+          </tbody>
+        </table>
+      </details>
+      <details>
+        <summary>invoice / filter &mdash; MongoDB document detail</summary>
+        <table>
+          <thead><tr><th>Document</th><th>Fields</th></tr></thead>
+          <tbody>
+            <tr><td>Invoice</td><td>id(String), cardHolder, modelName, brandName, plate, modelYear, dailyPrice, totalPrice, rentedForDays, rentedAt</td></tr>
+            <tr><td>Filter</td><td>id(String), carId, modelId, brandId, modelName, brandName, plate, modelYear, dailyPrice, state (free-text String)</td></tr>
+          </tbody>
+        </table>
+        <p><em>FilterRepository: deleteByCarId, deleteAllByBrandId, deleteAllByModelId, findByCarId &mdash; all four wired to real implementations, no remaining no-ops.</em></p>
+      </details>
+      <p><em>No SQL files or migration directories exist anywhere &mdash; schema comes entirely from Hibernate ddl-auto (value set externally). Inventory's MySQL <code>cars</code> table is the source of truth for car identity/state; every other store is a denormalized, eventually-consistent copy with no cross-service foreign keys. <code>filter-service</code> is a pure Kafka-fed CQRS read model &mdash; its controller is GET-only.</em></p>
+    </section>
+
+    <section id="config">
+      <h2>9. Configuration &amp; Deployment</h2>
+      <table>
+        <thead><tr><th>Key</th><th>Where it lives</th><th>Value</th></tr></thead>
+        <tbody>
+          <tr><td>spring.application.name</td><td>Local application.yml</td><td>e.g. INVENTORY-SERVICE, rental-service</td></tr>
+          <tr><td>spring.config.import</td><td>Local application.yml</td><td>optional:configserver:http://localhost:8888</td></tr>
+          <tr><td>config-server git URI</td><td>config-server/application.yml</td><td>github.com/altananay/config-server, label main, profile dev</td></tr>
+          <tr><td>server.port (6 business services)</td><td><span class="badge external">External</span></td><td>&lt;service&gt;-dev.yml in github.com/altananay/config-server</td></tr>
+          <tr><td>Datasource/Kafka/jwk-set-uri/resilience4j</td><td><span class="badge external">External</span></td><td>&lt;service&gt;-dev.yml / -prod.yml</td></tr>
+          <tr><td>discovery-server port 8761</td><td><span class="badge external">Inferred</span></td><td>Eureka framework default, never declared</td></tr>
+        </tbody>
+      </table>
+      <p><em>Stray key: api-gateway/application.yml:18 sets <code>eureka.instance.metadata-map.serviceId: inventory-service</code> inside the gateway's own config &mdash; copy-paste leftover, doesn't affect spring.application.name.</em></p>
+      <h3>Backing services (docker-compose.yml, 11 services, no .env file)</h3>
+      <table>
+        <thead><tr><th>Service</th><th>Image</th><th>Host port</th><th>Consumed by</th></tr></thead>
+        <tbody>
+          <tr><td>kafka</td><td>bashj79/kafka-kraft</td><td>9092 / 29092(internal)</td><td>all 6 business services + kafka-ui</td></tr>
+          <tr><td>kafka-ui</td><td>ghcr.io/kafbat/kafka-ui:latest</td><td>8090</td><td>operator tool</td></tr>
+          <tr><td>keycloak</td><td>quay.io/keycloak/keycloak:latest</td><td>8081&rarr;8080</td><td>all 6 business services</td></tr>
+          <tr><td>zipkin</td><td>openzipkin/zipkin</td><td>9411</td><td>tracing sink</td></tr>
+          <tr><td>prometheus</td><td>prom/prometheus</td><td>9090</td><td>scrapes 5 of 6 business services</td></tr>
+          <tr><td>grafana</td><td>grafana/grafana</td><td>3000</td><td>unprovisioned</td></tr>
+          <tr><td>mongodb / mongodbInvoice</td><td>mongo</td><td>27017 / 27018</td><td>filter-service / invoice-service</td></tr>
+          <tr><td>inventorydb</td><td>mysql</td><td>3307</td><td>inventory-service</td></tr>
+          <tr><td>postgresMaintenance/Payment/Rental</td><td>postgres:16</td><td>5431/5433/5434</td><td>maintenance/payment/rental-service</td></tr>
+        </tbody>
+      </table>
+      <p><em>No Spring Boot app is containerized. No Dockerfile exists anywhere. Kafka uses a dual-listener setup (localhost:9092 for host apps, kafka:29092 for containers) and mounts the corrected <code>/tmp/kraft-combined-logs</code> volume path. Keycloak mounts <code>keycloak_data:/opt/keycloak/data</code>, correcting an earlier setup where its dev-mode H2 database lived only in the container's ephemeral layer.</em></p>
+    </section>
+
+    <section id="observability">
+      <h2>10. Observability</h2>
+      <table>
+        <thead><tr><th>Scrape job</th><th>metrics_path</th><th>Actual name</th><th>Reachable?</th></tr></thead>
+        <tbody>
+          <tr><td>filter-service</td><td>/FILTER-SERVICE/actuator/prometheus</td><td>filter-service (lowercase)</td><td>No &mdash; gateway routes lowercase only</td></tr>
+          <tr><td>inventory-service</td><td>/inventory-service/actuator/prometheus</td><td>INVENTORY-SERVICE (routed lowercase)</td><td>Path OK, dependency gap below</td></tr>
+          <tr><td>maintenance-service</td><td>/maintenance-service/actuator/prometheus</td><td>maintenance-service</td><td>Path OK, dependency gap below</td></tr>
+          <tr><td>payment-service</td><td>/payment-service/actuator/prometheus</td><td>payment-service</td><td>Path OK, dependency gap below</td></tr>
+          <tr><td>rental-service</td><td>/rental-service/actuator/prometheus</td><td>rental-service</td><td>Path OK, dependency gap below</td></tr>
+        </tbody>
+      </table>
+      <p><em><strong>invoice-service and api-gateway have no scrape job at all.</strong> No module declares <code>micrometer-registry-prometheus</code> (repo-wide grep, zero matches) &mdash; without it, <code>/actuator/prometheus</code> doesn't exist on any service regardless of path casing, so all 5 configured jobs are non-functional. Tracing (Zipkin via Brave) is independent of this gap and should work if the external config supplies a valid endpoint. Grafana has no provisioning files and starts unconfigured.</em></p>
+    </section>
+
+    <section id="risks">
+      <h2>11. Risk Matrix</h2>
+      <table>
+        <thead><tr><th>#</th><th>Category</th><th>Finding</th><th>Evidence</th><th>Tag</th><th>Impact</th><th>Effort</th></tr></thead>
+        <tbody>
+          <tr><td>1</td><td>Data Consistency</td><td>RentalManager.add debits payment before saving the rental row &mdash; no compensation on failure</td><td><code>RentalManager.java</code></td><td>Confirmed</td><td><span class="badge high">High</span></td><td><span class="badge high">High</span></td></tr>
+          <tr><td>2</td><td>Observability</td><td>No micrometer-registry-prometheus anywhere &mdash; all 5 scrape jobs hit non-existent endpoints</td><td>grep across 10 pom.xml</td><td>Confirmed</td><td><span class="badge high">High</span></td><td><span class="badge low">Low</span></td></tr>
+          <tr><td>3</td><td>Observability</td><td>filter-service scrape job uses uppercase metrics_path, broken under lower-case-service-id</td><td>prometheus.yml vs api-gateway yml:8</td><td>Confirmed</td><td><span class="badge medium">Medium</span></td><td><span class="badge low">Low</span></td></tr>
+          <tr><td>4</td><td>Security</td><td>Every backing-service credential committed in plaintext in docker-compose.yml, no .env</td><td>docker-compose.yml:31,72,89,103,111,128</td><td>Confirmed</td><td><span class="badge medium">Medium</span></td><td><span class="badge low">Low</span></td></tr>
+          <tr><td>5</td><td>Resilience</td><td>Zero @CircuitBreaker anywhere; only 2 of 4 Feign methods have @Retry</td><td>repo-wide grep</td><td>Confirmed</td><td><span class="badge medium">Medium</span></td><td><span class="badge medium">Medium</span></td></tr>
+          <tr><td>6</td><td>Data Consistency</td><td>Every event-producing Manager does save+publish non-transactionally, no outbox</td><td>CarManager/BrandManager/MaintenanceManager/RentalManager</td><td>Confirmed</td><td><span class="badge medium">Medium</span></td><td><span class="badge high">High</span></td></tr>
+          <tr><td>7</td><td>Data Consistency</td><td>3 independent Postgres containers share the same named volume postgres_data</td><td>docker-compose.yml</td><td>Confirmed</td><td><span class="badge medium">Medium</span></td><td><span class="badge low">Low</span></td></tr>
+          <tr><td>8</td><td>API Contract</td><td>processRentalPayment has no @Valid despite a validated DTO type</td><td>PaymentsController.java:37</td><td>Confirmed</td><td><span class="badge medium">Medium</span></td><td><span class="badge low">Low</span></td></tr>
+          <tr><td>9</td><td>Build</td><td>Boot parent split 3.1.0 (maintenance/payment) vs 3.0.6 (rest)</td><td>10 pom.xml files</td><td>Confirmed</td><td><span class="badge low">Low</span></td><td><span class="badge low">Low</span></td></tr>
+          <tr><td>10</td><td>Build</td><td>Maven wrapper drift 3.8.7 vs 3.9.1/3.9.2; inventory-service wrapper missing license header</td><td>.mvn/wrapper/maven-wrapper.properties per module</td><td>Confirmed</td><td><span class="badge low">Low</span></td><td><span class="badge low">Low</span></td></tr>
+          <tr><td>11</td><td>Build</td><td>payment-service/pom.xml declares spring-boot-starter-test twice</td><td>payment-service/pom.xml:25-28,41-44</td><td>Confirmed</td><td><span class="badge low">Low</span></td><td><span class="badge low">Low</span></td></tr>
+          <tr><td>12</td><td>Security</td><td>permitAll covers /api/cars and /api/cars/** at URL layer; true gate is a hidden method-level @Secured</td><td>SecurityConfig.java:22-29 vs CarsController.java:28</td><td>Confirmed</td><td><span class="badge low">Low</span></td><td><span class="badge low">Low</span></td></tr>
+          <tr><td>13</td><td>Security</td><td>/api/payments/check is a dead permitAll rule, no controller maps it</td><td>SecurityConfig.java</td><td>Confirmed</td><td><span class="badge low">Low</span></td><td><span class="badge low">Low</span></td></tr>
+          <tr><td>14</td><td>Testing</td><td>api-gateway, config-server, discovery-server have zero test files each</td><td>src/test trees</td><td>Confirmed</td><td><span class="badge low">Low</span></td><td><span class="badge medium">Medium</span></td></tr>
+        </tbody>
+      </table>
+      <p><em><strong>Update &mdash; 2026-08-03: Finding #1 fixed.</strong> RentalManager.add no longer calls PaymentClient directly. Rental creation is now driven by an orchestration-based saga (<code>rental-service/business/saga/RentalCreationSagaOrchestrator</code>, persisted <code>rental_creation_sagas</code> state machine) with idempotent charge/refund on the payment-service side (<code>processed_payment_operations</code>, keyed on an <code>Idempotency-Key</code> header) and a <code>SagaRecoveryScheduler</code> that resumes any saga stuck mid-flow after a crash. A failure after a successful charge now triggers an automatic compensating refund instead of leaving the customer debited with no rental. See <code>CLAUDE.md</code> &sect;12 (&ldquo;POST /api/rentals &mdash; orchestration-based saga&rdquo;) for the full state diagram and design notes. The row above is left as-is as the point-in-time finding that motivated the fix.</em></p>
+    </section>
+
+    <section id="handoff">
+      <h2>12. Handoff Notes</h2>
+      <p>External config repo (<code>github.com/altananay/config-server</code>) was out of scope per the Scope Caveat &mdash; a full picture of datasource URLs, Kafka bootstrap servers, jwk-set-uri, and resilience4j policies requires auditing that repo separately.</p>
+      <p>Keycloak realm (<code>RentACarMicroservice</code>, roles user/admin, client gateway-client) is provisioned via the Admin REST API during local setup, not a committed realm-export JSON &mdash; rebuilding the environment from scratch requires re-running that provisioning.</p>
+      <p>No frontend/mobile client exists in this repo; nothing here covers client-side concerns.</p>
+    </section>
+  </main>
+
+  <script>mermaid.initialize({ startOnLoad: true, theme: 'dark' });</script>
+</body>
+</html>

@@ -1,5 +1,5 @@
 ---
-name: Turkcell-rentACar-microservice
+name: Turkcell-rentACar-microservice-analyst
 description: Audits the Turkcell rent-a-car Spring Boot microservices repo — 10-module topology, endpoint inventory across 8 controllers, Keycloak auth model, OpenFeign sync call chains and resilience, Kafka event choreography, polyglot persistence across MySQL/PostgreSQL/MongoDB, externalized config-server setup, gateway routing and the observability stack — and writes a full report to backend-audit/. Use when asked to audit, review, or map the backend's services, endpoints, events, data stores, or auth model, or before a major refactor, security review, or engineer onboarding.
 when_to_use: Trigger phrases — "audit the backend", "map the services/endpoints", "map the Kafka events", "which service owns X", "review the data stores", "check the auth model", "onboard me to this backend".
 argument-hint: '[service or concern to focus on, e.g. "rental flow", "kafka choreography", "gateway routing", "resilience"]'

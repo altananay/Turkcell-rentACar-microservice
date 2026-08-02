@@ -4,10 +4,10 @@
 
 ## How this skill is invoked
 
-This is a standard Claude Code project skill living at `.claude/skills/Turkcell-rentACar-microservice/`. Claude Code handles discovery and invocation natively — there is no separate orchestration layer to maintain:
+This is a standard Claude Code project skill living at `.claude/skills/Turkcell-rentACar-microservice-analyst/`. Claude Code handles discovery and invocation natively — there is no separate orchestration layer to maintain:
 
 - **Automatic**: Claude loads it when a prompt matches `SKILL.md`'s `description`/`when_to_use` (e.g. "audit the backend", "map the services", "map the Kafka events").
-- **Manual**: type `/Turkcell-rentACar-microservice` (the command name comes from the directory name, not the frontmatter `name` field). Because the directory wins, `SKILL.md`'s frontmatter `name` is deliberately set to match it — a mismatched `name` is silently ignored and only misleads whoever reads the file next.
+- **Manual**: type `/Turkcell-rentACar-microservice-analyst` (the command name comes from the directory name, not the frontmatter `name` field). Because the directory wins, `SKILL.md`'s frontmatter `name` is deliberately set to match it — a mismatched `name` is silently ignored and only misleads whoever reads the file next. The `-analyst` suffix on the directory name is also deliberate: it makes the skill's read-only, analysis-only purpose visible from the path alone, without opening any file.
 - Only `SKILL.md` loads automatically on invocation. `STANDARDS.md` (and this file) are supporting files Claude reads on demand, when `SKILL.md` points to them — this keeps the always-in-context cost to just the `description` line until the skill actually runs.
 
 ## File layout

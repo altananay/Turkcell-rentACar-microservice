@@ -39,8 +39,8 @@ argument-hint: 'Describe a specific service, flow, or concern to analyse (e.g. "
 
 This agent executes by strictly following every step defined in:
 
-> [`SKILL.md`](.claude/skills/Turkcell-rentACar-microservice/SKILL.md) — step-by-step execution procedure
-> [`STANDARDS.md`](.claude/skills/Turkcell-rentACar-microservice/STANDARDS.md) — output templates, syntax rules, and the File Creation Validation Checklist
+> [`SKILL.md`](.claude/skills/Turkcell-rentACar-microservice-analyst/SKILL.md) — step-by-step execution procedure
+> [`STANDARDS.md`](.claude/skills/Turkcell-rentACar-microservice-analyst/STANDARDS.md) — output templates, syntax rules, and the File Creation Validation Checklist
 
 **Do NOT skip, reorder, or summarise steps.** All steps, output format requirements, and validation checklists in those files are authoritative and must be completed in full.
 

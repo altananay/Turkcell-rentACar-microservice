@@ -21,6 +21,7 @@ import java.util.List;
 import java.util.UUID;
 
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.when;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.*;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
@@ -100,12 +101,21 @@ class PaymentsControllerTest {
     // service and still returns 200 — this documents the missing validation, not desired behavior.
     @Test
     void processRentalPayment_withInvalidBody_stillReturns200() throws Exception {
-        when(service.processRentalPayment(any(CreateRentalPaymentRequest.class)))
+        when(service.processRentalPayment(anyString(), any(CreateRentalPaymentRequest.class)))
                 .thenReturn(new ClientResponse());
 
         mockMvc.perform(post("/api/payments/process-rental-payment")
+                        .header("Idempotency-Key", "saga-123")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("{}"))
                 .andExpect(status().isOk());
+    }
+
+    @Test
+    void processRentalPayment_withMissingIdempotencyKeyHeader_returns400() throws Exception {
+        mockMvc.perform(post("/api/payments/process-rental-payment")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{}"))
+                .andExpect(status().isBadRequest());
     }
 }

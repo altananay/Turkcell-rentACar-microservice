@@ -1,15 +1,10 @@
 package com.kodlamaio.rentalservice.business.concretes;
 
-import com.kodlamaio.commonpackage.events.rental.RentalCreatedEvent;
 import com.kodlamaio.commonpackage.events.rental.RentalDeletedEvent;
-import com.kodlamaio.commonpackage.events.rentalPayment.RentalPaymentCreatedEvent;
 import com.kodlamaio.commonpackage.kafka.producer.KafkaProducer;
-import com.kodlamaio.commonpackage.utils.dto.CarClientResponse;
-import com.kodlamaio.commonpackage.utils.dto.CreateRentalPaymentRequest;
 import com.kodlamaio.commonpackage.utils.dto.PaymentRequest;
 import com.kodlamaio.commonpackage.utils.exceptions.BusinessException;
 import com.kodlamaio.commonpackage.utils.mappers.ModelMapperService;
-import com.kodlamaio.rentalservice.api.clients.CarClient;
 import com.kodlamaio.rentalservice.business.dto.requests.CreateRentalRequest;
 import com.kodlamaio.rentalservice.business.dto.requests.UpdateRentalRequest;
 import com.kodlamaio.rentalservice.business.dto.responses.CreateRentalResponse;
@@ -17,6 +12,7 @@ import com.kodlamaio.rentalservice.business.dto.responses.GetAllRentalsResponse;
 import com.kodlamaio.rentalservice.business.dto.responses.GetRentalResponse;
 import com.kodlamaio.rentalservice.business.dto.responses.UpdateRentalResponse;
 import com.kodlamaio.rentalservice.business.rules.RentalBusinessRules;
+import com.kodlamaio.rentalservice.business.saga.RentalCreationSagaOrchestrator;
 import com.kodlamaio.rentalservice.entities.Rental;
 import com.kodlamaio.rentalservice.repository.RentalRepository;
 import org.junit.jupiter.api.Test;
@@ -34,7 +30,6 @@ import java.util.UUID;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
-import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.*;
 
@@ -45,7 +40,7 @@ class RentalManagerTest {
     @Mock private ModelMapperService mapper;
     @Mock private RentalBusinessRules rules;
     @Mock private KafkaProducer producer;
-    @Mock private CarClient carClient;
+    @Mock private RentalCreationSagaOrchestrator sagaOrchestrator;
     @Mock private ModelMapper modelMapper;
 
     @InjectMocks
@@ -97,63 +92,29 @@ class RentalManagerTest {
     }
 
     @Test
-    void add_whenCarAvailableAndPaymentProcessed_savesRentalAndPublishesTwoEvents() {
+    void add_whenCarAvailable_delegatesToSagaOrchestratorAndReturnsMappedResponse() {
         var carId = UUID.randomUUID();
         var paymentRequest = new PaymentRequest("1234567890123456", "John Doe", 2025, 6, "123");
         var request = new CreateRentalRequest(carId, 100.0, 3, paymentRequest);
 
-        // Represents what mapper.forRequest().map(request, Rental.class) would produce;
-        // seeded with a non-null id to prove rental.setId(null) actually runs.
-        var mappedRental = new Rental();
-        mappedRental.setId(UUID.randomUUID());
-        mappedRental.setCarId(carId);
-        mappedRental.setDailyPrice(100.0);
-        mappedRental.setRentedForDays(3);
-
-        var carClientResponse = new CarClientResponse();
+        var rental = new Rental();
         var createResponse = new CreateRentalResponse();
 
-        when(mapper.forRequest()).thenReturn(modelMapper);
+        when(sagaOrchestrator.createRental(request)).thenReturn(rental);
         when(mapper.forResponse()).thenReturn(modelMapper);
-        // lenient(): the manager also calls the 2-arg void map(source, destination)
-        // overload 4 times (payment request fields, RentalPaymentCreatedEvent fields),
-        // left unstubbed since this test doesn't assert on that mutation. Mockito's
-        // strict stubbing otherwise flags those unmatched void calls as a
-        // PotentialStubbingProblem against the two Class-based map(...) stubs below
-        // (same mock, same method name, different overload) — lenient() exempts them.
-        lenient().when(modelMapper.map(request, Rental.class)).thenReturn(mappedRental);
-        lenient().when(modelMapper.map(mappedRental, CreateRentalResponse.class)).thenReturn(createResponse);
-        when(repository.save(any(Rental.class))).thenAnswer(invocation -> invocation.getArgument(0));
-        when(carClient.getCar(carId)).thenReturn(carClientResponse);
+        when(modelMapper.map(rental, CreateRentalResponse.class)).thenReturn(createResponse);
 
         var result = rentalManager.add(request);
 
-        verify(rules).ensureCarIsAvailable(carId);
-
-        var paymentCaptor = ArgumentCaptor.forClass(CreateRentalPaymentRequest.class);
-        verify(rules).ensurePaymentIsProcessed(paymentCaptor.capture());
-        assertThat(paymentCaptor.getValue().getPrice()).isEqualTo(300.0);
-
-        verify(carClient).getCar(carId);
-        verify(repository).save(mappedRental);
-
-        assertThat(mappedRental.getId()).isNull();
-        assertThat(mappedRental.getTotalPrice()).isEqualTo(300.0);
-        assertThat(mappedRental.getRentedAt()).isNotNull();
-
-        verify(producer, times(2)).sendMessage(any(), anyString());
-        var createdEventCaptor = ArgumentCaptor.forClass(RentalCreatedEvent.class);
-        var paymentEventCaptor = ArgumentCaptor.forClass(RentalPaymentCreatedEvent.class);
-        verify(producer).sendMessage(createdEventCaptor.capture(), eq("rental-created"));
-        verify(producer).sendMessage(paymentEventCaptor.capture(), eq("rental-payment-created"));
-        assertThat(createdEventCaptor.getValue().getCarId()).isEqualTo(carId);
-        assertThat(paymentEventCaptor.getValue().getRentedAt()).isNotNull();
+        var inOrder = inOrder(rules, sagaOrchestrator);
+        inOrder.verify(rules).ensureCarIsAvailable(carId);
+        inOrder.verify(sagaOrchestrator).createRental(request);
 
         assertThat(result).isSameAs(createResponse);
     }
 
     @Test
-    void add_whenCarNotAvailable_throwsAndNeverSaves() {
+    void add_whenCarNotAvailable_throwsAndNeverCallsOrchestrator() {
         var carId = UUID.randomUUID();
         var request = new CreateRentalRequest(carId, 100.0, 3, new PaymentRequest());
         doThrow(new BusinessException("CAR_NOT_AVAILABLE")).when(rules).ensureCarIsAvailable(carId);
@@ -162,7 +123,7 @@ class RentalManagerTest {
                 .isInstanceOf(BusinessException.class)
                 .hasMessage("CAR_NOT_AVAILABLE");
 
-        verifyNoInteractions(repository, producer);
+        verifyNoInteractions(sagaOrchestrator, repository, producer);
     }
 
     @Test

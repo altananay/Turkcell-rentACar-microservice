@@ -140,6 +140,7 @@ Bootstrap for every business service:
 - `payment-service` uses `entity` (singular) and adds `adapters/FakePosServiceAdapter` implementing `business/abstracts/PosService`.
 - `filter-service` base package is `kodlamaio.filterservice` — **no `com.` prefix**; its pom `groupId` is `kodlamaio`; it has no `business/rules` package and only response DTOs.
 - `rental-service` additionally has `business/saga/` (`RentalCreationSagaOrchestrator`, `SagaRecoveryScheduler`) — a deliberate deviation from the skeleton above, since a persisted state machine coordinating a `*Manager`, a Feign client, and Kafka publishing isn't a `*Manager` or `*BusinessRules`. See §12 for the saga itself.
+- The 3 event-producing JPA services (`inventory-service`, `maintenance-service`, `rental-service`) each have `business/outbox/` (`OutboxRecorder`, `OutboxRelay`) plus `entities/OutboxMessage` and `repository/OutboxMessageRepository` — same placement convention as the saga (entity and repository in the standard packages, behaviour in its own `business/` sub-package). The four files are **near-identical across the three services on purpose**: `common-package` has no JPA and cannot get any (see §4), and an outbox table is part of a service's own schema rather than a shared contract. See §12.
 
 ---
 
@@ -148,7 +149,7 @@ Bootstrap for every business service:
 1. `common-package` is the leaf. It imports no service package. Never add one.
 2. Every business service depends on `common-package`. `config-server`, `discovery-server` and `api-gateway` must **not** — `common-package` pulls `spring-boot-starter-web` (MVC), which would flip the WebFlux gateway to a servlet stack and break Spring Cloud Gateway.
 3. Services never import one another. Cross-service data crosses only via `commonpackage.utils.dto.*` (Feign) or `commonpackage.events.*` (Kafka).
-4. A type shared by two services goes in `common-package`, never duplicated. Adding one requires `cd common-package && ./mvnw install` before the consumer compiles.
+4. A type shared by two services goes in `common-package`, never duplicated. Adding one requires `cd common-package && ./mvnw install` before the consumer compiles. **One deliberate exception, do not "fix" it:** the outbox quartet (`OutboxMessage`, `OutboxMessageRepository`, `OutboxRecorder`, `OutboxRelay`) is duplicated in the 3 JPA services. `common-package` declares no JPA, and adding `spring-boot-starter-data-jpa` there would activate `DataSourceAutoConfiguration` in `filter-service` and `invoice-service`, which are MongoDB-only and have no datasource — both would fail at startup.
 5. Inside a service: the controller depends on `business/abstracts/*Service`, never on `*Manager` directly. A `*Manager` owns exactly one repository. A `*BusinessRules` throws only `BusinessException`.
 6. Feign clients live in `api/clients` and are invoked from `business/rules` (precedent: `RentalBusinessRules.ensureCarIsAvailable`) or `business/concretes`/`business/saga` (precedent: `RentalCreationSagaOrchestrator` calling `PaymentClient`/`CarClient`) — never from a controller.
 7. Kafka consumers live in `business/kafka/consumer` and delegate to the `*Service` interface — no direct repository access.
@@ -335,7 +336,12 @@ Rules:
 
 ### Kafka (async, choreography)
 
-7 topics. **Topic names are hardcoded string literals at every call site — there is no topic constants class.** The producer is `commonpackage.kafka.producer.KafkaProducer#sendMessage(T extends Event, String topic)`.
+7 topics. **Topic names are hardcoded string literals at every call site — there is no topic constants class.** The producer is `commonpackage.kafka.producer.KafkaProducer`, which has two methods:
+
+- `sendMessage(T extends Event, String topic)` — fire-and-forget, discards the send future. A broker failure is never observed. **No business code calls this any more**; it is only still reachable for a caller that genuinely wants no delivery guarantee.
+- `sendMessageAndWait(T extends Event, String topic)` — blocks on the future (10s) and throws `IllegalStateException` if the broker does not acknowledge. **Only `OutboxRelay` calls this.**
+
+**No `*Manager` publishes to Kafka directly.** Every event goes through the outbox (see below).
 
 | Topic | Producer | Consumers (`groupId`) |
 |---|---|---|
@@ -348,7 +354,29 @@ Rules:
 | `maintenance-deleted` | maintenance-service `MaintenanceManager` | inventory-service + filter-service `MaintenanceConsumer` |
 | `rental-payment-created` | rental-service `RentalManager` | invoice-service `RentalConsumer` (`rental-payment-create`) |
 
-Adding a topic requires: the event class in `common-package/events/<domain>/`, a `sendMessage(event, "topic")` call, a `@KafkaListener(topics = …, groupId = …)`, and a `common-package` reinstall.
+The Producer column above names the class that *records* the event; the actual Kafka publish always happens in that service's `OutboxRelay`.
+
+Adding a topic requires: the event class in `common-package/events/<domain>/`, an `outboxRecorder.record(event, "topic")` call inside the producing transaction, **an entry in that service's `OutboxRelay.TOPIC_TYPES` map** (forget this and the row is never published — it logs an ERROR every 5s), a `@KafkaListener(topics = …, groupId = …)`, and a `common-package` reinstall.
+
+### Transactional outbox (inventory-service, maintenance-service, rental-service)
+
+Fixes the audit's finding #6: `repository.save(...)` and `producer.sendMessage(...)` used to be two independent non-transactional steps, so a crash between them — or simply a Kafka outage, which the fire-and-forget send never even detected — left the datastore and the event stream permanently inconsistent.
+
+```
+business method
+  └─ transactionTemplate: entity write + outboxRecorder.record(event, topic)   [one local tx, commits together]
+
+OutboxRelay  @Scheduled(fixedDelay = 5000)
+  └─ findTop100ByPublishedFalseOrderByCreatedAtAsc
+       └─ resolve class from TOPIC_TYPES -> readValue -> sendMessageAndWait -> mark published
+```
+
+- **`OutboxMessage` carries the topic, not the event class name.** The relay maps topic → class via a static `TOPIC_TYPES` map, so renaming or moving an event class is a compile error instead of a `ClassNotFoundException` on rows written months earlier.
+- **A publish failure abandons the whole batch** (`return`, not `continue`) — the broker being unreachable means the rest would fail too, and each blocking send would otherwise monopolise the single shared `@Scheduled` thread, starving `SagaRecoveryScheduler`. A deserialize failure is the opposite: log ERROR and `continue`. Consequence to know: a genuinely poison row blocks everything behind it, loudly, with a WARN naming its id every 5s.
+- **Delivery is at-least-once.** `@Version` prevents a double *mark*, not a double *send* — the claim happens after the publish. This is why consumer-side dedup exists (see §13).
+- **The two delete flows read inside the transaction.** `MaintenanceManager.delete` and `RentalManager.delete` load the entity in-tx and call `repository.delete(entity)`, never `deleteById`. `deleteById` silently no-ops on an already-deleted row, so a pre-transaction read would let a concurrent delete commit an outbox row describing a deletion that never happened — and the outbox would then deliver it reliably. `CarManager`/`BrandManager` don't need this: their event payload is only the id.
+- **Latency:** events now reach consumers up to 5 seconds after the HTTP response. `POST /api/cars` followed immediately by `GET /api/filters` will not show the car. Expected, not a bug.
+- Published rows are never purged; the table grows unbounded. Acceptable for local dev, noted so nobody is surprised.
 
 ### OpenFeign (sync)
 
@@ -376,8 +404,8 @@ STARTED --charge succeeds--> PAYMENT_CHARGED --rental saved + saga COMPLETED--> 
 - `saga.getId()` is sent as the `Idempotency-Key` header on both `PaymentClient` calls. `payment-service` records every charge/refund in `processed_payment_operations` (unique on `idempotencyKey` + `operationType`) and replays the stored result on a repeat, so a retried charge or refund never double-executes.
 - Rental-row-save + saga-status-advance is one local `TransactionTemplate` transaction in rental-service; balance-mutate + idempotency-record-save is one local `TransactionTemplate` transaction in payment-service. **No transaction spans both services** — cross-service consistency is the saga's persisted state + compensation, never a transaction manager.
 - `business/saga/SagaRecoveryScheduler` (`@Scheduled(fixedDelay = 30000)`, needs `@EnableScheduling` on `RentalServiceApplication`) re-drives any saga stuck in `STARTED`/`PAYMENT_CHARGED`/`COMPENSATING` for >60s — this is what makes payment-before-save recoverable after a crash instead of silently leaking a charge.
-- Kafka publishing (`rental-created`, `rental-payment-created`) happens only after the local transaction commits, and is deliberately best-effort/fire-and-forget (same as everywhere else in this codebase) — a publish failure after commit is logged and swallowed, **never** triggers compensation on an already-successful rental.
-- Scope boundary: this saga guarantees payment ⇄ rental-row consistency only. It does not add a transactional outbox or touch downstream consumer idempotency (e.g. filter-service's raw Mongo insert on `car-created`).
+- `rental-created` and `rental-payment-created` are **recorded into the outbox inside that same transaction**, so "rental committed but events lost" is unreachable. The old best-effort post-commit publish (and the invariant it had to protect) is gone: anything failing in the transaction now rolls back the rental too, which makes routing to `compensate` correct rather than a bug. It also closes a hole the saga alone had — the idempotent-replay branch returns early without publishing, so a crash between commit and publish used to lose the events permanently.
+- Scope boundary: this saga guarantees payment ⇄ rental-row consistency. Rental-row ⇄ event-stream consistency is the outbox's job (see §12).
 - `RentalCreationSaga`/`ProcessedPaymentOperation` both use `@Version` optimistic locking — a losing concurrent writer (a live request racing the recovery scheduler) gets `OptimisticLockingFailureException`, caught and treated as "someone else already handled this."
 
 ---
@@ -395,7 +423,9 @@ STARTED --charge succeeds--> PAYMENT_CHARGED --rental saved + saga COMPLETED--> 
 | invoice-service | MongoDB | 27018 | `MongoRepository` | `@Document`, `@Id String id` |
 | filter-service | MongoDB | 27017 | `MongoRepository` | `@Document`, `@Id String id` |
 
+- The 3 event-producing JPA services each own an `outbox_messages` table (`inventory-service`, `maintenance-service`, `rental-service`). Created by `ddl-auto: update` like everything else — **if that ever becomes `create-drop`, unpublished rows are wiped on every restart and the outbox silently stops guaranteeing anything.**
 - Every non-inventory service stores `UUID carId` as a plain column/field with **no foreign key**. Cross-service references are denormalized by design — never add an FK across services.
+- **Consumer-side dedup** (required because outbox delivery is at-least-once, see §12): `FilterManager.add` reuses an existing document's id when the incoming `Filter` has none, turning the `car-created` insert into an upsert keyed on `carId`; `InvoiceManager.add` does the same keyed on `Invoice.rentalId`, guarded by `Objects.nonNull` because Mongo matches a null `rentalId` against every invoice written before that field existed. Both use `findFirst…` finders, never single-result ones — duplicates already in the local collections would otherwise throw `IncorrectResultSizeDataAccessException`. There is **no unique index** on either collection: `@Indexed(unique = true)` is a no-op unless `spring.data.mongodb.auto-index-creation=true` (external config, Boot 3 default is `false`), and enabling it with duplicates present stops the service booting.
 - `filter-service` is a Kafka-fed CQRS read model. Never write to it over HTTP.
 - Its `Filter.state` is a free-text `String` (`"Rented"` / `"Maintenance"` / `"Available"`) duplicating inventory's `State` enum. Keep the two in sync when either changes.
 
@@ -403,7 +433,7 @@ STARTED --charge succeeds--> PAYMENT_CHARGED --rental saved + saga COMPLETED--> 
 
 ## 14) Testing
 
-**Current state:** ~184 unit tests across `common-package` and all 6 business services, covering `*Manager`, `*BusinessRules`, `*Controller`, `*Consumer`, `*ClientFallback`, and (rental-service only) `business/saga/*` classes. All are plain Mockito/AssertJ unit tests or `MockMvcBuilders.standaloneSetup` controller tests — no `@SpringBootTest`, no Spring context, no config-server or database dependency. They pass with all backing infrastructure stopped. The old default `*ApplicationTests.java` `contextLoads()` stubs (one per module, Spring Initializr boilerplate) have been deleted — they required a live config-server/Keycloak to load the context and asserted nothing. `spring-security-test` is not declared anywhere; controller tests that need `@Valid` enforcement use `standaloneSetup`, which wires Bean Validation automatically without a security context.
+**Current state:** ~236 unit tests across `common-package` and all 6 business services, covering `*Manager`, `*BusinessRules`, `*Controller`, `*Consumer`, `*ClientFallback`, `business/outbox/*` (the 3 JPA services), and (rental-service only) `business/saga/*` classes. All are plain Mockito/AssertJ unit tests or `MockMvcBuilders.standaloneSetup` controller tests — no `@SpringBootTest`, no Spring context, no config-server or database dependency. They pass with all backing infrastructure stopped. The old default `*ApplicationTests.java` `contextLoads()` stubs (one per module, Spring Initializr boilerplate) have been deleted — they required a live config-server/Keycloak to load the context and asserted nothing. `spring-security-test` is not declared anywhere; controller tests that need `@Valid` enforcement use `standaloneSetup`, which wires Bean Validation automatically without a security context.
 
 **Mockito pitfall hit while testing the saga (worth remembering):** re-stubbing a mock method with `when(mock.method(any())).thenX(...)` a second time, when the method's *first* stub was a side-effecting `thenAnswer(...)`, re-invokes that first Answer as a side effect of setting up the second stub — because `when(...)` has to actually call the mock method to record it, and `any()` evaluates to `null` at that call site. If the Answer dereferences its argument (e.g. `((Consumer) inv.getArgument(0)).accept(...)`), this NPEs during test setup, not during the real assertion. Fix: use `doThrow(...).when(mock).method(any())` (or `doAnswer`/`doReturn`) for the *second* stub — that syntax records the stub without re-triggering the currently active one.
 
@@ -424,6 +454,10 @@ STARTED --charge succeeds--> PAYMENT_CHARGED --rental saved + saga COMPLETED--> 
 | `business/kafka/consumer/*Consumer` | Event maps to the right service call | The `*Service` interface |
 | `business/saga/RentalCreationSagaOrchestrator` | Every status transition, compensation, idempotent replay, optimistic-lock skip, post-commit Kafka isolation | Both repositories, `PaymentClient`, `CarClient`, `KafkaProducer`, `TransactionTemplate` (stub `executeWithoutResult`/`execute` to actually run the lambda) |
 | `business/saga/SagaRecoveryScheduler` | Correct recoverable-status query, one saga's failure doesn't block the batch | `RentalCreationSagaRepository`, `RentalCreationSagaOrchestrator` |
+| `business/outbox/OutboxRecorder` | Topic + payload stored unpublished, payload round-trips back to an equal event, serialization failure throws | `OutboxMessageRepository`; use a **real** `Jackson2ObjectMapperBuilder.json().build()`, not a mock — serialization is the behaviour under test |
+| `business/outbox/OutboxRelay` | Blocking send is used, mark-published on success, deserialize failure skips one row, publish failure abandons the batch, optimistic-lock skip, empty batch | `OutboxMessageRepository`, `KafkaProducer`; `@Spy` the real `ObjectMapper` |
+
+**Atomicity tests.** Every manager whose write is now wrapped in a `TransactionTemplate` has one dedicated test proving the entity write and the outbox record happen *inside* the same transaction: override the shared stub so the lambda does **not** run, call the method, assert `verifyNoInteractions(repository, outboxRecorder)`, then capture the `Consumer<TransactionStatus>` (or `TransactionCallback<T>` for `CarManager.add`) and run it manually, asserting both writes happened. This is the strongest atomicity assertion available without a real database, and it is the reason to keep `TransactionTemplate` rather than `@Transactional` — the annotation is inert under Mockito.
 
 ### Anti-patterns
 
@@ -478,6 +512,11 @@ Approved defaults (all declared in `common-package/pom.xml`):
 - `common-package` ships `CommonPackageApplication` (`@SpringBootApplication`) inside the scanned `ConfigurationBasePackage`, so every service component-scans a nested application class.
 - `invoice-service` exposes only `GET /api/invoices`; its `getById` and Create/Update DTOs are unreachable over HTTP.
 - No Dockerfile exists anywhere. `docker-compose.yml` provides backing services only.
+- Adding a Kafka topic without adding it to the producing service's `OutboxRelay.TOPIC_TYPES` map means the row is written and never published — an ERROR every 5 seconds, no compile error.
+- `ddl-auto` must stay `update` in the external config repo. `create-drop` would wipe unpublished `outbox_messages` rows on every restart.
+- Event delivery is at-least-once and up to 5 seconds late. Anything that assumed inline publishing (a read-your-write against `filter-service` right after a `POST`) will look broken and isn't.
+- `KafkaProducer.sendMessage` logs the whole event via `event.toString()`, which for `RentalPaymentCreatedEvent` includes `cardHolder` — §9 says never log PII. Pre-existing; not fixed here.
+- `InvoiceManager` injects a `KafkaProducer` it never uses. Pre-existing dead field.
 
 ---
 

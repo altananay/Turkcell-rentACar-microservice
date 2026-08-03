@@ -21,7 +21,9 @@ import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
@@ -82,11 +84,44 @@ class InvoiceManagerTest {
     }
 
     @Test
-    void add_savesInvoice() {
-        var invoice = new Invoice();
+    void add_whenAnInvoiceForTheRentalAlreadyExists_reusesExistingIdSoSaveUpserts() {
+        var rentalId = UUID.randomUUID();
+        var incoming = new Invoice();
+        incoming.setRentalId(rentalId);
+        var existing = new Invoice();
+        existing.setId("existing-invoice-id");
 
-        invoiceManager.add(invoice);
+        when(repository.findFirstByRentalId(rentalId)).thenReturn(Optional.of(existing));
 
-        verify(repository).save(invoice);
+        invoiceManager.add(incoming);
+
+        assertThat(incoming.getId()).isEqualTo("existing-invoice-id");
+        verify(repository).save(incoming);
+    }
+
+    @Test
+    void add_whenNoInvoiceExistsForTheRental_savesAsANewDocument() {
+        var rentalId = UUID.randomUUID();
+        var incoming = new Invoice();
+        incoming.setRentalId(rentalId);
+
+        when(repository.findFirstByRentalId(rentalId)).thenReturn(Optional.empty());
+
+        invoiceManager.add(incoming);
+
+        assertThat(incoming.getId()).isNull();
+        verify(repository).save(incoming);
+    }
+
+    @Test
+    void add_whenEventCarriedNoRentalId_savesWithoutAnyDedupLookup() {
+        // Messages published before rentalId existed deserialize with a null one, and Mongo would
+        // match that null against every legacy invoice.
+        var incoming = new Invoice();
+
+        invoiceManager.add(incoming);
+
+        verify(repository, never()).findFirstByRentalId(any());
+        verify(repository).save(incoming);
     }
 }

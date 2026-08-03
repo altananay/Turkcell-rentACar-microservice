@@ -1,7 +1,6 @@
 package com.kodlamaio.inventoryservice.business.concretes;
 
 import com.kodlamaio.commonpackage.events.inventory.BrandDeletedEvent;
-import com.kodlamaio.commonpackage.kafka.producer.KafkaProducer;
 import com.kodlamaio.commonpackage.utils.mappers.ModelMapperService;
 import com.kodlamaio.inventoryservice.business.abstracts.BrandService;
 import com.kodlamaio.inventoryservice.business.dto.requests.create.CreateBrandRequest;
@@ -10,11 +9,13 @@ import com.kodlamaio.inventoryservice.business.dto.responses.create.CreateBrandR
 import com.kodlamaio.inventoryservice.business.dto.responses.get.GetAllBrandsResponse;
 import com.kodlamaio.inventoryservice.business.dto.responses.get.GetBrandResponse;
 import com.kodlamaio.inventoryservice.business.dto.responses.update.UpdateBrandResponse;
+import com.kodlamaio.inventoryservice.business.outbox.OutboxRecorder;
 import com.kodlamaio.inventoryservice.business.rules.BrandBusinessRules;
 import com.kodlamaio.inventoryservice.entities.Brand;
 import com.kodlamaio.inventoryservice.repository.BrandRepository;
 import lombok.AllArgsConstructor;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.support.TransactionTemplate;
 
 import java.util.List;
 import java.util.UUID;
@@ -26,7 +27,8 @@ public class BrandManager implements BrandService {
     private final BrandRepository repository;
     private final ModelMapperService mapperService;
     private final BrandBusinessRules rules;
-    private final KafkaProducer producer;
+    private final OutboxRecorder outboxRecorder;
+    private final TransactionTemplate transactionTemplate;
 
     @Override
     public List<GetAllBrandsResponse> getAll() {
@@ -65,11 +67,13 @@ public class BrandManager implements BrandService {
     @Override
     public void delete(UUID id) {
         rules.checkIfBrandExists(id);
-        repository.deleteById(id);
-        sendKafkaBrandDeletedEvent(id);
+        transactionTemplate.executeWithoutResult(status -> {
+            recordBrandDeletedEvent(id);
+            repository.deleteById(id);
+        });
     }
 
-    private void sendKafkaBrandDeletedEvent(UUID id) {
-        producer.sendMessage(new BrandDeletedEvent(id), "brand-deleted");
+    private void recordBrandDeletedEvent(UUID id) {
+        outboxRecorder.record(new BrandDeletedEvent(id), "brand-deleted");
     }
 }

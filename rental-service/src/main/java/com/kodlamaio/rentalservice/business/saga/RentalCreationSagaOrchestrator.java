@@ -2,7 +2,6 @@ package com.kodlamaio.rentalservice.business.saga;
 
 import com.kodlamaio.commonpackage.events.rental.RentalCreatedEvent;
 import com.kodlamaio.commonpackage.events.rentalPayment.RentalPaymentCreatedEvent;
-import com.kodlamaio.commonpackage.kafka.producer.KafkaProducer;
 import com.kodlamaio.commonpackage.utils.dto.CarClientResponse;
 import com.kodlamaio.commonpackage.utils.dto.ClientResponse;
 import com.kodlamaio.commonpackage.utils.dto.CreateRentalPaymentRequest;
@@ -10,6 +9,7 @@ import com.kodlamaio.commonpackage.utils.exceptions.BusinessException;
 import com.kodlamaio.rentalservice.api.clients.CarClient;
 import com.kodlamaio.rentalservice.api.clients.PaymentClient;
 import com.kodlamaio.rentalservice.business.dto.requests.CreateRentalRequest;
+import com.kodlamaio.rentalservice.business.outbox.OutboxRecorder;
 import com.kodlamaio.rentalservice.entities.Rental;
 import com.kodlamaio.rentalservice.entities.RentalCreationSaga;
 import com.kodlamaio.rentalservice.entities.enums.SagaStatus;
@@ -31,7 +31,7 @@ public class RentalCreationSagaOrchestrator {
     private final RentalRepository rentalRepository;
     private final PaymentClient paymentClient;
     private final CarClient carClient;
-    private final KafkaProducer producer;
+    private final OutboxRecorder outboxRecorder;
     private final TransactionTemplate transactionTemplate;
 
     public Rental createRental(CreateRentalRequest request) {
@@ -85,24 +85,18 @@ public class RentalCreationSagaOrchestrator {
         CarClientResponse carClientResponse = carClient.getCar(saga.getCarId());
         Rental rental = buildRental(saga);
 
+        // The events are recorded in the same transaction as the rental, so "rental saved but events
+        // lost" is unreachable. Anything failing in here rolls back both, which is exactly why routing
+        // to compensate() afterwards is correct rather than a bug - nothing was committed.
         transactionTemplate.executeWithoutResult(status -> {
             rentalRepository.save(rental);
             saga.setStatus(SagaStatus.COMPLETED);
             sagaRepository.save(saga);
+            outboxRecorder.record(new RentalCreatedEvent(saga.getCarId()), "rental-created");
+            outboxRecorder.record(buildPaymentCreatedEvent(saga, rental, carClientResponse), "rental-payment-created");
         });
-        // Committed. Nothing from here on may trigger compensation.
 
-        publishBestEffort(saga, rental, carClientResponse);
         return rental;
-    }
-
-    private void publishBestEffort(RentalCreationSaga saga, Rental rental, CarClientResponse carClientResponse) {
-        try {
-            producer.sendMessage(new RentalCreatedEvent(saga.getCarId()), "rental-created");
-            producer.sendMessage(buildPaymentCreatedEvent(saga, rental, carClientResponse), "rental-payment-created");
-        } catch (Exception e) {
-            log.error("Best-effort Kafka publish failed after saga {} completed: {}", saga.getId(), e.getMessage());
-        }
     }
 
     private void compensate(RentalCreationSaga saga, Exception cause) {
@@ -188,6 +182,7 @@ public class RentalCreationSagaOrchestrator {
         event.setTotalPrice(rental.getTotalPrice());
         event.setRentedForDays(rental.getRentedForDays());
         event.setRentedAt(saga.getCreatedAt());
+        event.setRentalId(saga.getRentalId());
         return event;
     }
 }

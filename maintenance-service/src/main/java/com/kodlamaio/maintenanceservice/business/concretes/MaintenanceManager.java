@@ -2,7 +2,8 @@ package com.kodlamaio.maintenanceservice.business.concretes;
 
 import com.kodlamaio.commonpackage.events.maintenance.MaintenanceCreatedEvent;
 import com.kodlamaio.commonpackage.events.maintenance.MaintenanceDeletedEvent;
-import com.kodlamaio.commonpackage.kafka.producer.KafkaProducer;
+import com.kodlamaio.commonpackage.utils.constants.Messages;
+import com.kodlamaio.commonpackage.utils.exceptions.BusinessException;
 import com.kodlamaio.commonpackage.utils.mappers.ModelMapperService;
 import com.kodlamaio.maintenanceservice.business.abstracts.MaintenanceService;
 import com.kodlamaio.maintenanceservice.business.dto.requests.CreateMaintenanceRequest;
@@ -11,11 +12,13 @@ import com.kodlamaio.maintenanceservice.business.dto.responses.CreateMaintenance
 import com.kodlamaio.maintenanceservice.business.dto.responses.GetAllMaintenancesResponse;
 import com.kodlamaio.maintenanceservice.business.dto.responses.GetMaintenanceResponse;
 import com.kodlamaio.maintenanceservice.business.dto.responses.UpdateMaintenanceResponse;
+import com.kodlamaio.maintenanceservice.business.outbox.OutboxRecorder;
 import com.kodlamaio.maintenanceservice.business.rules.MaintenanceBusinessRules;
 import com.kodlamaio.maintenanceservice.entities.Maintenance;
 import com.kodlamaio.maintenanceservice.repository.MaintenanceRepository;
 import lombok.AllArgsConstructor;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.support.TransactionTemplate;
 
 import java.time.LocalDateTime;
 import java.util.List;
@@ -27,7 +30,8 @@ public class MaintenanceManager implements MaintenanceService {
     private final MaintenanceRepository repository;
     private final ModelMapperService mapper;
     private final MaintenanceBusinessRules rules;
-    private final KafkaProducer producer;
+    private final OutboxRecorder outboxRecorder;
+    private final TransactionTemplate transactionTemplate;
 
     @Override
     public List<GetAllMaintenancesResponse> getAll() {
@@ -59,8 +63,10 @@ public class MaintenanceManager implements MaintenanceService {
         maintenance.setCompleted(false);
         maintenance.setStartDate(LocalDateTime.now());
         maintenance.setEndDate(null);
-        repository.save(maintenance);
-        sendKafkaMaintenanceCreatedEvent(request.getCarId());
+        transactionTemplate.executeWithoutResult(status -> {
+            repository.save(maintenance);
+            outboxRecorder.record(new MaintenanceCreatedEvent(request.getCarId()), "maintenance-created");
+        });
 
         CreateMaintenanceResponse response = mapper.forResponse().map(maintenance, CreateMaintenanceResponse.class);
 
@@ -81,8 +87,15 @@ public class MaintenanceManager implements MaintenanceService {
     @Override
     public void delete(UUID id) {
         rules.checkIfMaintenanceExists(id);
-        sendKafkaMaintenanceDeletedEvent(id);
-        repository.deleteById(id);
+        transactionTemplate.executeWithoutResult(status -> {
+            // Re-read inside the transaction rather than before it: deleteById is a silent no-op when
+            // the row is already gone, so a pre-transaction read would let a concurrent delete commit
+            // an outbox row describing a deletion this call never performed.
+            var maintenance = repository.findById(id)
+                    .orElseThrow(() -> new BusinessException(Messages.Maintenance.NotExists));
+            outboxRecorder.record(new MaintenanceDeletedEvent(maintenance.getCarId()), "maintenance-deleted");
+            repository.delete(maintenance);
+        });
     }
 
     /* private void makeCarAvailableIfIsCompletedFalse(UUID id) {
@@ -91,12 +104,4 @@ public class MaintenanceManager implements MaintenanceService {
              carService.changeState(carId, State.AVAILABLE);
          }
      } */
-    private void sendKafkaMaintenanceCreatedEvent(UUID carId) {
-        producer.sendMessage(new MaintenanceCreatedEvent(carId), "maintenance-created");
-    }
-
-    private void sendKafkaMaintenanceDeletedEvent(UUID id) {
-        var carId = repository.findById(id).orElseThrow().getCarId();
-        producer.sendMessage(new MaintenanceDeletedEvent(carId), "maintenance-deleted");
-    }
 }

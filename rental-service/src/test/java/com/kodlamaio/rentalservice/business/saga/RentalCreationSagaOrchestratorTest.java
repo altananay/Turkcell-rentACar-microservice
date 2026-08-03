@@ -2,7 +2,7 @@ package com.kodlamaio.rentalservice.business.saga;
 
 import com.kodlamaio.commonpackage.events.rental.RentalCreatedEvent;
 import com.kodlamaio.commonpackage.events.rentalPayment.RentalPaymentCreatedEvent;
-import com.kodlamaio.commonpackage.kafka.producer.KafkaProducer;
+import com.kodlamaio.rentalservice.business.outbox.OutboxRecorder;
 import com.kodlamaio.commonpackage.utils.dto.CarClientResponse;
 import com.kodlamaio.commonpackage.utils.dto.ClientResponse;
 import com.kodlamaio.commonpackage.utils.dto.CreateRentalPaymentRequest;
@@ -46,7 +46,7 @@ class RentalCreationSagaOrchestratorTest {
     @Mock private RentalRepository rentalRepository;
     @Mock private PaymentClient paymentClient;
     @Mock private CarClient carClient;
-    @Mock private KafkaProducer producer;
+    @Mock private OutboxRecorder outboxRecorder;
     @Mock private TransactionTemplate transactionTemplate;
 
     @InjectMocks
@@ -80,7 +80,7 @@ class RentalCreationSagaOrchestratorTest {
     }
 
     @Test
-    void createRental_happyPath_chargesPaymentSavesRentalAndPublishesBothEvents() {
+    void createRental_happyPath_chargesPaymentSavesRentalAndRecordsBothEventsInOutbox() {
         var carId = UUID.randomUUID();
         var paymentRequest = new PaymentRequest("1234567890123456", "John Doe", 2025, 6, "123");
         var request = new CreateRentalRequest(carId, 100.0, 3, paymentRequest);
@@ -124,14 +124,40 @@ class RentalCreationSagaOrchestratorTest {
         assertThat(savedRental.getRentedAt()).isEqualTo(saga.getCreatedAt().toLocalDate());
 
         var createdEventCaptor = ArgumentCaptor.forClass(RentalCreatedEvent.class);
-        verify(producer).sendMessage(createdEventCaptor.capture(), eq("rental-created"));
+        verify(outboxRecorder).record(createdEventCaptor.capture(), eq("rental-created"));
         assertThat(createdEventCaptor.getValue().getCarId()).isEqualTo(carId);
         var paymentEventCaptor = ArgumentCaptor.forClass(RentalPaymentCreatedEvent.class);
-        verify(producer).sendMessage(paymentEventCaptor.capture(), eq("rental-payment-created"));
+        verify(outboxRecorder).record(paymentEventCaptor.capture(), eq("rental-payment-created"));
         assertThat(paymentEventCaptor.getValue().getModelName()).isEqualTo("Corolla");
         assertThat(paymentEventCaptor.getValue().getTotalPrice()).isEqualTo(300.0);
+        assertThat(paymentEventCaptor.getValue().getRentalId()).isEqualTo(saga.getRentalId());
 
         assertThat(result).isSameAs(savedRental);
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void completeRentalCreation_recordsBothEventsInsideTheSameTransactionAsTheRentalAndSagaSaves() {
+        var saga = newSaga(SagaStatus.PAYMENT_CHARGED);
+        when(rentalRepository.findById(saga.getRentalId())).thenReturn(Optional.empty());
+        when(carClient.getCar(saga.getCarId())).thenReturn(new CarClientResponse());
+        when(rentalRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
+        // Override the shared stub so the lambda is NOT run - see the doX().when() note in CLAUDE.md 14.
+        doNothing().when(transactionTemplate).executeWithoutResult(any());
+
+        orchestrator.drive(saga);
+
+        verify(rentalRepository, never()).save(any());
+        verifyNoInteractions(outboxRecorder);
+
+        var actionCaptor = ArgumentCaptor.forClass(Consumer.class);
+        verify(transactionTemplate).executeWithoutResult(actionCaptor.capture());
+        actionCaptor.getValue().accept(null);
+
+        verify(rentalRepository).save(any(Rental.class));
+        verify(sagaRepository).save(saga);
+        verify(outboxRecorder).record(any(RentalCreatedEvent.class), eq("rental-created"));
+        verify(outboxRecorder).record(any(RentalPaymentCreatedEvent.class), eq("rental-payment-created"));
     }
 
     @Test
@@ -174,7 +200,7 @@ class RentalCreationSagaOrchestratorTest {
 
         assertThat(saga.getStatus()).isEqualTo(SagaStatus.COMPENSATED);
         verify(paymentClient).refundRentalPayment(eq(saga.getId().toString()), any());
-        verifyNoInteractions(producer);
+        verifyNoInteractions(outboxRecorder);
     }
 
     @Test
@@ -231,7 +257,7 @@ class RentalCreationSagaOrchestratorTest {
 
         assertThat(result).isNull();
         assertThat(saga.getStatus()).isEqualTo(SagaStatus.COMPENSATED);
-        verifyNoInteractions(rentalRepository, carClient, producer);
+        verifyNoInteractions(rentalRepository, carClient, outboxRecorder);
     }
 
     @Test
@@ -246,7 +272,7 @@ class RentalCreationSagaOrchestratorTest {
         assertThat(result).isSameAs(existingRental);
         assertThat(saga.getStatus()).isEqualTo(SagaStatus.COMPLETED);
         verify(rentalRepository, never()).save(any());
-        verifyNoInteractions(carClient, producer);
+        verifyNoInteractions(carClient, outboxRecorder);
     }
 
     @Test
@@ -297,18 +323,24 @@ class RentalCreationSagaOrchestratorTest {
         assertThat(rentalCaptor.getValue().getRentedAt()).isEqualTo(saga.getCreatedAt().toLocalDate());
     }
 
+    // Replaces the old post-commit-publish test. Recording the events now happens inside the same
+    // transaction as the rental, so "rental committed but events lost" is unreachable and refunding
+    // is the correct outcome rather than the bug the old best-effort publish had to guard against.
     @Test
-    void drive_whenKafkaPublishFailsAfterCommit_doesNotCompensate() {
+    void drive_whenOutboxRecordFailsInsideTransaction_compensatesBecauseNothingWasCommitted() {
         var saga = newSaga(SagaStatus.PAYMENT_CHARGED);
         when(rentalRepository.findById(saga.getRentalId())).thenReturn(Optional.empty());
         when(carClient.getCar(saga.getCarId())).thenReturn(new CarClientResponse());
         when(rentalRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
-        doThrow(new RuntimeException("kafka down")).when(producer).sendMessage(any(), anyString());
+        doThrow(new IllegalStateException("could not serialize"))
+                .when(outboxRecorder).record(any(), anyString());
+        when(paymentClient.refundRentalPayment(anyString(), any())).thenReturn(new ClientResponse(true, null));
 
-        var result = orchestrator.drive(saga);
+        assertThatThrownBy(() -> orchestrator.drive(saga))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessage("could not serialize");
 
-        assertThat(result).isNotNull();
-        assertThat(saga.getStatus()).isEqualTo(SagaStatus.COMPLETED);
-        verifyNoInteractions(paymentClient);
+        verify(paymentClient).refundRentalPayment(eq(saga.getId().toString()), any());
+        assertThat(saga.getStatus()).isEqualTo(SagaStatus.COMPENSATED);
     }
 }

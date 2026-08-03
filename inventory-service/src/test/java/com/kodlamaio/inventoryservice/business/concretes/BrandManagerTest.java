@@ -1,8 +1,9 @@
 package com.kodlamaio.inventoryservice.business.concretes;
 
 import com.kodlamaio.commonpackage.events.inventory.BrandDeletedEvent;
-import com.kodlamaio.commonpackage.kafka.producer.KafkaProducer;
+import com.kodlamaio.commonpackage.utils.exceptions.BusinessException;
 import com.kodlamaio.commonpackage.utils.mappers.ModelMapperService;
+import com.kodlamaio.inventoryservice.business.outbox.OutboxRecorder;
 import com.kodlamaio.inventoryservice.business.dto.requests.create.CreateBrandRequest;
 import com.kodlamaio.inventoryservice.business.dto.requests.update.UpdateBrandRequest;
 import com.kodlamaio.inventoryservice.business.dto.responses.create.CreateBrandResponse;
@@ -12,6 +13,7 @@ import com.kodlamaio.inventoryservice.business.dto.responses.update.UpdateBrandR
 import com.kodlamaio.inventoryservice.business.rules.BrandBusinessRules;
 import com.kodlamaio.inventoryservice.entities.Brand;
 import com.kodlamaio.inventoryservice.repository.BrandRepository;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.ArgumentCaptor;
@@ -19,12 +21,17 @@ import org.mockito.InjectMocks;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.modelmapper.ModelMapper;
+import org.springframework.transaction.TransactionStatus;
+import org.springframework.transaction.support.TransactionTemplate;
 
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
+import java.util.function.Consumer;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.*;
 
@@ -34,11 +41,21 @@ class BrandManagerTest {
     @Mock private BrandRepository repository;
     @Mock private ModelMapperService mapperService;
     @Mock private BrandBusinessRules rules;
-    @Mock private KafkaProducer producer;
+    @Mock private OutboxRecorder outboxRecorder;
+    @Mock private TransactionTemplate transactionTemplate;
     @Mock private ModelMapper modelMapper;
 
     @InjectMocks
     private BrandManager brandManager;
+
+    @BeforeEach
+    void stubTransactionTemplateToRunLambda() {
+        lenient().doAnswer(invocation -> {
+            Consumer<TransactionStatus> action = invocation.getArgument(0);
+            action.accept(null);
+            return null;
+        }).when(transactionTemplate).executeWithoutResult(any());
+    }
 
     @Test
     void getAll_mapsEveryBrandToResponse() {
@@ -112,7 +129,7 @@ class BrandManagerTest {
     }
 
     @Test
-    void delete_whenBrandExists_deletesAndPublishesBrandDeletedEvent() {
+    void delete_whenBrandExists_recordsBrandDeletedEventAndDeletes() {
         var brandId = UUID.randomUUID();
 
         brandManager.delete(brandId);
@@ -121,7 +138,35 @@ class BrandManagerTest {
         verify(repository).deleteById(brandId);
 
         var eventCaptor = ArgumentCaptor.forClass(BrandDeletedEvent.class);
-        verify(producer).sendMessage(eventCaptor.capture(), eq("brand-deleted"));
+        verify(outboxRecorder).record(eventCaptor.capture(), eq("brand-deleted"));
         assertThat(eventCaptor.getValue().getBrandId()).isEqualTo(brandId);
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void delete_recordsEventAndDeletesInsideOneTransaction() {
+        var brandId = UUID.randomUUID();
+        doNothing().when(transactionTemplate).executeWithoutResult(any());
+
+        brandManager.delete(brandId);
+
+        verifyNoInteractions(repository, outboxRecorder);
+
+        var actionCaptor = ArgumentCaptor.forClass(Consumer.class);
+        verify(transactionTemplate).executeWithoutResult(actionCaptor.capture());
+        actionCaptor.getValue().accept(null);
+
+        verify(outboxRecorder).record(any(BrandDeletedEvent.class), eq("brand-deleted"));
+        verify(repository).deleteById(brandId);
+    }
+
+    @Test
+    void delete_whenRulesReject_neverOpensTransactionAndNeverRecords() {
+        var brandId = UUID.randomUUID();
+        doThrow(new BusinessException("BRAND_NOT_EXISTS")).when(rules).checkIfBrandExists(brandId);
+
+        assertThrows(BusinessException.class, () -> brandManager.delete(brandId));
+
+        verifyNoInteractions(transactionTemplate, repository, outboxRecorder);
     }
 }

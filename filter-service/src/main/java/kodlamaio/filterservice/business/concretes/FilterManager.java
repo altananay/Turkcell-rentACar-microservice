@@ -10,6 +10,7 @@ import lombok.AllArgsConstructor;
 import org.springframework.stereotype.Service;
 
 import java.util.List;
+import java.util.Objects;
 import java.util.UUID;
 
 @Service
@@ -39,6 +40,13 @@ public class FilterManager implements FilterService {
 
     @Override
     public void add(Filter filter) {
+        // A Filter mapped straight from a CarCreatedEvent has no id, so a redelivered event would
+        // insert a second document for the same car. Reusing the existing document's id turns that
+        // insert into a replace. Callers that already loaded the filter keep their id untouched.
+        if (Objects.isNull(filter.getId())) {
+            repository.findFirstByCarIdOrderByIdAsc(filter.getCarId())
+                    .ifPresent(existing -> filter.setId(existing.getId()));
+        }
         repository.save(filter);
     }
 
@@ -64,6 +72,6 @@ public class FilterManager implements FilterService {
 
     @Override
     public Filter getByCarId(UUID carId) {
-        return repository.findByCarId(carId);
+        return repository.findFirstByCarIdOrderByIdAsc(carId).orElse(null);
     }
 }

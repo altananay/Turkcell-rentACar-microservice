@@ -12,6 +12,7 @@ import lombok.AllArgsConstructor;
 import org.springframework.stereotype.Service;
 
 import java.util.List;
+import java.util.Objects;
 
 @Service
 @AllArgsConstructor
@@ -39,6 +40,13 @@ public class InvoiceManager implements InvoiceService {
 
     @Override
     public void add(Invoice invoice) {
+        // A redelivered rental-payment-created event would otherwise insert a second invoice for the
+        // same rental. The null guard is load-bearing, not defensive padding: Mongo matches a null
+        // rentalId against every invoice written before the field existed.
+        if (Objects.nonNull(invoice.getRentalId())) {
+            repository.findFirstByRentalId(invoice.getRentalId())
+                    .ifPresent(existing -> invoice.setId(existing.getId()));
+        }
         repository.save(invoice);
     }
 }

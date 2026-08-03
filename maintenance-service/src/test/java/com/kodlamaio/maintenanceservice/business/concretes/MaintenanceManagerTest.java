@@ -2,9 +2,9 @@ package com.kodlamaio.maintenanceservice.business.concretes;
 
 import com.kodlamaio.commonpackage.events.maintenance.MaintenanceCreatedEvent;
 import com.kodlamaio.commonpackage.events.maintenance.MaintenanceDeletedEvent;
-import com.kodlamaio.commonpackage.kafka.producer.KafkaProducer;
 import com.kodlamaio.commonpackage.utils.exceptions.BusinessException;
 import com.kodlamaio.commonpackage.utils.mappers.ModelMapperService;
+import com.kodlamaio.maintenanceservice.business.outbox.OutboxRecorder;
 import com.kodlamaio.maintenanceservice.business.dto.requests.CreateMaintenanceRequest;
 import com.kodlamaio.maintenanceservice.business.dto.requests.UpdateMaintenanceRequest;
 import com.kodlamaio.maintenanceservice.business.dto.responses.CreateMaintenanceResponse;
@@ -14,6 +14,7 @@ import com.kodlamaio.maintenanceservice.business.dto.responses.UpdateMaintenance
 import com.kodlamaio.maintenanceservice.business.rules.MaintenanceBusinessRules;
 import com.kodlamaio.maintenanceservice.entities.Maintenance;
 import com.kodlamaio.maintenanceservice.repository.MaintenanceRepository;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.ArgumentCaptor;
@@ -22,10 +23,13 @@ import org.mockito.InjectMocks;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.modelmapper.ModelMapper;
+import org.springframework.transaction.TransactionStatus;
+import org.springframework.transaction.support.TransactionTemplate;
 
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
+import java.util.function.Consumer;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -39,11 +43,21 @@ class MaintenanceManagerTest {
     @Mock private MaintenanceRepository repository;
     @Mock private ModelMapperService mapper;
     @Mock private MaintenanceBusinessRules rules;
-    @Mock private KafkaProducer producer;
+    @Mock private OutboxRecorder outboxRecorder;
+    @Mock private TransactionTemplate transactionTemplate;
     @Mock private ModelMapper modelMapper;
 
     @InjectMocks
     private MaintenanceManager maintenanceManager;
+
+    @BeforeEach
+    void stubTransactionTemplateToRunLambda() {
+        lenient().doAnswer(invocation -> {
+            Consumer<TransactionStatus> action = invocation.getArgument(0);
+            action.accept(null);
+            return null;
+        }).when(transactionTemplate).executeWithoutResult(any());
+    }
 
     @Test
     void getAll_mapsEveryMaintenanceToResponse() {
@@ -89,7 +103,7 @@ class MaintenanceManagerTest {
     }
 
     @Test
-    void add_checksCarUnderMaintenanceThenAvailability_assignsFieldsAndPublishesMaintenanceCreatedEvent() {
+    void add_checksCarUnderMaintenanceThenAvailability_savesMaintenanceAndRecordsMaintenanceCreatedEventInOutbox() {
         var carId = UUID.randomUUID();
         var request = new CreateMaintenanceRequest();
         request.setCarId(carId);
@@ -117,10 +131,36 @@ class MaintenanceManagerTest {
         assertThat(saved.getEndDate()).isNull();
 
         var eventCaptor = ArgumentCaptor.forClass(MaintenanceCreatedEvent.class);
-        verify(producer).sendMessage(eventCaptor.capture(), eq("maintenance-created"));
+        verify(outboxRecorder).record(eventCaptor.capture(), eq("maintenance-created"));
         assertThat(eventCaptor.getValue().getCarId()).isEqualTo(carId);
 
         assertThat(result).isSameAs(response);
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void add_savesMaintenanceAndRecordsEventInsideOneTransaction() {
+        var carId = UUID.randomUUID();
+        var request = new CreateMaintenanceRequest();
+        request.setCarId(carId);
+        var mappedMaintenance = new Maintenance();
+
+        when(mapper.forRequest()).thenReturn(modelMapper);
+        when(modelMapper.map(request, Maintenance.class)).thenReturn(mappedMaintenance);
+        when(mapper.forResponse()).thenReturn(modelMapper);
+        // Override the shared stub so the lambda is NOT run - see the doX().when() note in CLAUDE.md 14.
+        doNothing().when(transactionTemplate).executeWithoutResult(any());
+
+        maintenanceManager.add(request);
+
+        verifyNoInteractions(repository, outboxRecorder);
+
+        var actionCaptor = ArgumentCaptor.forClass(Consumer.class);
+        verify(transactionTemplate).executeWithoutResult(actionCaptor.capture());
+        actionCaptor.getValue().accept(null);
+
+        verify(repository).save(mappedMaintenance);
+        verify(outboxRecorder).record(any(MaintenanceCreatedEvent.class), eq("maintenance-created"));
     }
 
     @Test
@@ -147,23 +187,54 @@ class MaintenanceManagerTest {
     }
 
     @Test
-    void delete_publishesMaintenanceDeletedEventBeforeDeletingFromRepository() {
+    @SuppressWarnings("unchecked")
+    void delete_readsCarIdRecordsEventAndDeletesTheLoadedEntityInsideOneTransaction() {
         var id = UUID.randomUUID();
         var carId = UUID.randomUUID();
         var maintenance = new Maintenance();
         maintenance.setCarId(carId);
 
         when(repository.findById(id)).thenReturn(Optional.of(maintenance));
+        doNothing().when(transactionTemplate).executeWithoutResult(any());
 
         maintenanceManager.delete(id);
 
         verify(rules).checkIfMaintenanceExists(id);
+        verifyNoInteractions(outboxRecorder);
+        verify(repository, never()).findById(any());
+
+        var actionCaptor = ArgumentCaptor.forClass(Consumer.class);
+        verify(transactionTemplate).executeWithoutResult(actionCaptor.capture());
+        actionCaptor.getValue().accept(null);
 
         var eventCaptor = ArgumentCaptor.forClass(MaintenanceDeletedEvent.class);
-        InOrder callOrder = inOrder(producer, repository);
-        callOrder.verify(producer).sendMessage(eventCaptor.capture(), eq("maintenance-deleted"));
-        callOrder.verify(repository).deleteById(id);
-
+        verify(outboxRecorder).record(eventCaptor.capture(), eq("maintenance-deleted"));
         assertThat(eventCaptor.getValue().getCarId()).isEqualTo(carId);
+        // The loaded entity is deleted, not the id: deleteById silently no-ops on an already-gone row.
+        verify(repository).delete(maintenance);
+    }
+
+    @Test
+    void delete_whenRowIsGoneAtTransactionTime_throwsBusinessExceptionAndRecordsNothing() {
+        var id = UUID.randomUUID();
+        when(repository.findById(id)).thenReturn(Optional.empty());
+
+        assertThatThrownBy(() -> maintenanceManager.delete(id))
+                .isInstanceOf(BusinessException.class)
+                .hasMessage("MAINTENANCE_NOT_EXISTS");
+
+        verifyNoInteractions(outboxRecorder);
+        verify(repository, never()).delete(any());
+    }
+
+    @Test
+    void delete_whenRulesReject_neverOpensTransactionAndNeverRecords() {
+        var id = UUID.randomUUID();
+        doThrow(new BusinessException("MAINTENANCE_NOT_EXISTS")).when(rules).checkIfMaintenanceExists(id);
+
+        assertThatThrownBy(() -> maintenanceManager.delete(id))
+                .isInstanceOf(BusinessException.class);
+
+        verifyNoInteractions(transactionTemplate, repository, outboxRecorder);
     }
 }

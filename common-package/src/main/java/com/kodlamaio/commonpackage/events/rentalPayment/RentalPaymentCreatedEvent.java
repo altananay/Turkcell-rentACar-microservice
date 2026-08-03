@@ -7,6 +7,7 @@ import lombok.NoArgsConstructor;
 import lombok.Setter;
 
 import java.time.LocalDateTime;
+import java.util.UUID;
 
 @AllArgsConstructor
 @NoArgsConstructor
@@ -22,4 +23,5 @@ public class RentalPaymentCreatedEvent implements Event {
     private double totalPrice;
     private int rentedForDays;
     private LocalDateTime rentedAt;
+    private UUID rentalId;
 }

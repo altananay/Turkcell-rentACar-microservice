@@ -19,6 +19,8 @@ import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
@@ -77,13 +79,45 @@ class FilterManagerTest {
     }
 
     @Test
-    void add_savesFilterDirectlyWithoutMapping() {
+    void add_whenFilterHasNoIdAndCarAlreadyHasADocument_reusesExistingIdSoSaveUpserts() {
+        var carId = UUID.randomUUID();
+        var incoming = new Filter();
+        incoming.setCarId(carId);
+        var existing = new Filter();
+        existing.setId("existing-filter-id");
+
+        when(repository.findFirstByCarIdOrderByIdAsc(carId)).thenReturn(Optional.of(existing));
+
+        filterManager.add(incoming);
+
+        assertThat(incoming.getId()).isEqualTo("existing-filter-id");
+        verify(repository).save(incoming);
+        verifyNoInteractions(mapper);
+    }
+
+    @Test
+    void add_whenFilterHasNoIdAndCarHasNoDocument_savesAsANewDocument() {
+        var carId = UUID.randomUUID();
+        var incoming = new Filter();
+        incoming.setCarId(carId);
+
+        when(repository.findFirstByCarIdOrderByIdAsc(carId)).thenReturn(Optional.empty());
+
+        filterManager.add(incoming);
+
+        assertThat(incoming.getId()).isNull();
+        verify(repository).save(incoming);
+    }
+
+    @Test
+    void add_whenFilterAlreadyHasAnId_savesWithoutAnyLookup() {
         var filter = new Filter();
+        filter.setId("already-loaded");
 
         filterManager.add(filter);
 
+        verify(repository, never()).findFirstByCarIdOrderByIdAsc(any());
         verify(repository).save(filter);
-        verifyNoInteractions(mapper);
     }
 
     @Test
@@ -123,24 +157,27 @@ class FilterManagerTest {
     }
 
     @Test
-    void getByCarId_whenFilterExists_returnsFilter() {
+    void getByCarId_whenDuplicateDocumentsExist_returnsTheFirstWithoutThrowing() {
+        // findFirst is what makes this safe: a single-result finder throws
+        // IncorrectResultSizeDataAccessException against the duplicates this collection
+        // accumulated before car-created became an upsert.
         var carId = UUID.randomUUID();
-        var filter = new Filter();
+        var oldest = new Filter();
+        oldest.setId("oldest");
 
-        when(repository.findByCarId(carId)).thenReturn(filter);
+        when(repository.findFirstByCarIdOrderByIdAsc(carId)).thenReturn(Optional.of(oldest));
 
         var result = filterManager.getByCarId(carId);
 
-        assertThat(result).isSameAs(filter);
+        assertThat(result).isSameAs(oldest);
     }
 
     @Test
-    void getByCarId_whenNoFilterExists_returnsNull() {
-        // getByCarId has no null-guard in production code — it returns
-        // whatever the repository gives it, including a literal null.
+    void getByCarId_whenNoDocumentExists_returnsNull() {
+        // The four consumers null-check the result, so the contract stays null rather than Optional.
         var carId = UUID.randomUUID();
 
-        when(repository.findByCarId(carId)).thenReturn(null);
+        when(repository.findFirstByCarIdOrderByIdAsc(carId)).thenReturn(Optional.empty());
 
         var result = filterManager.getByCarId(carId);
 

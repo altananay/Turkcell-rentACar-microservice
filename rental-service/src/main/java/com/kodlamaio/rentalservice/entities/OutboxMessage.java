@@ -16,7 +16,9 @@ import java.util.UUID;
 @NoArgsConstructor
 @AllArgsConstructor
 @Table(name = "outbox_messages",
-        indexes = @Index(name = "idx_outbox_unpublished", columnList = "published, created_at"))
+        // Entity property names, not physical column names - Hibernate resolves the logical name
+        // through the naming strategy itself, so "created_at" here fails at EntityManagerFactory build.
+        indexes = @Index(name = "idx_outbox_unpublished", columnList = "published, createdAt"))
 public class OutboxMessage {
     @Id
     @GeneratedValue(strategy = GenerationType.UUID)

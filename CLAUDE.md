@@ -140,6 +140,7 @@ Bootstrap for every business service:
 - `payment-service` uses `entity` (singular) and adds `adapters/FakePosServiceAdapter` implementing `business/abstracts/PosService`.
 - `filter-service` base package is `kodlamaio.filterservice` — **no `com.` prefix**; its pom `groupId` is `kodlamaio`; it has no `business/rules` package and only response DTOs.
 - `rental-service` additionally has `business/saga/` (`RentalCreationSagaOrchestrator`, `SagaRecoveryScheduler`) — a deliberate deviation from the skeleton above, since a persisted state machine coordinating a `*Manager`, a Feign client, and Kafka publishing isn't a `*Manager` or `*BusinessRules`. See §12 for the saga itself.
+- `rental-service/api/clients/` additionally holds `PaymentClientTokenConfiguration` — a Feign configuration class, not a `*Client`/`*ClientFallback`. It **deliberately carries no class-level annotation** (see §11 and §16); it is wired only by `@FeignClient(configuration = ...)` on `PaymentClient`.
 - The 3 event-producing JPA services (`inventory-service`, `maintenance-service`, `rental-service`) each have `business/outbox/` (`OutboxRecorder`, `OutboxRelay`) plus `entities/OutboxMessage` and `repository/OutboxMessageRepository` — same placement convention as the saga (entity and repository in the standard packages, behaviour in its own `business/` sub-package). The four files are **near-identical across the three services on purpose**: `common-package` has no JPA and cannot get any (see §4), and an outbox table is part of a service's own schema rather than a shared contract. See §12.
 
 ---
@@ -316,15 +317,29 @@ Rules:
 
 **Keycloak OIDC resource server. There is no jwt, no `JwtAuthenticationFilter`, and no homegrown token code.**
 
-- Realm `RentACarMicroservice` at `localhost:8081` (the container maps host 8081 → container 8080). Realm roles: `user`, `admin`. Test user `altananay` / `12345` has both roles; client `gateway-client` (public, direct access grants enabled) issues tokens via the password grant.
+- Realm `RentACarMicroservice` at `localhost:8081` (the container maps host 8081 → container 8080). Realm roles: `user`, `admin`, `service`. Test user `altananay` / `12345` has `user` + `admin`; client `gateway-client` (public, direct access grants enabled) issues tokens via the password grant.
+- **`service` is a machine-only role.** It belongs to the service account of the confidential client `rental-service-client` (Client authentication ON, Service accounts roles ON, standard flow and direct access grants OFF), never to a human. It exists so `/api/payments/process-rental-payment` and `/api/payments/refund-rental-payment` are callable *only* by rental-service and not by any logged-in user's token.
 - **`keycloak`'s data now persists** via the `keycloak_data:/opt/keycloak/data` volume (added after a container restart wiped the realm — Keycloak's `start-dev` H2 database lives in the container's writable layer by default, gone on any recreate unless that path is mounted). If the realm ever goes missing again despite the volume, check `docker volume ls` for `turkcell-rentacar-microservice_keycloak_data` and whether the container is actually mounting it.
 - One shared filter chain for every service: `common-package/src/main/java/com/kodlamaio/commonpackage/security/SecurityConfig.java`, annotated `@EnableMethodSecurity(securedEnabled = true)`. The `jwk-set-uri` comes from the external config repo.
 - `utils/security/KeycloakJwtRoleConverter` maps the `realm_access.roles` claim to `ROLE_<role>` authorities.
 - Matcher order — **first match wins**:
   1. `permitAll()`: `/api/filters`, `/api/cars/check-car-available/**`, `/api/payments/check`, `/api/cars`, `/api/cars/**`, `/actuator/**`
-  2. `/api/**` → `hasAnyRole("user")`
-  3. `anyRequest().authenticated()`
+  2. `/api/payments/process-rental-payment`, `/api/payments/refund-rental-payment` → `hasRole("service")`
+  3. `/api/**` → `hasAnyRole("user")`
+  4. `anyRequest().authenticated()`
   `cors()` is enabled, `csrf()` is disabled.
+
+### Outbound: how rental-service authenticates itself
+
+**`rental-service` obtains its own Keycloak token via the `client_credentials` grant** — it does *not* forward the caller's header. `api/clients/PaymentClientTokenConfiguration` declares an `AuthorizedClientServiceOAuth2AuthorizedClientManager` plus a Feign `RequestInterceptor` that sets `Authorization: Bearer <service token>`.
+
+Three things about it are load-bearing and easy to undo by accident:
+
+- **The manager must be `AuthorizedClientService…`, not `Default…`.** `DefaultOAuth2AuthorizedClientManager` resolves the token from the current servlet request. `SagaRecoveryScheduler` and the charge/refund calls it drives run on a `@Scheduled` thread with no request, so the Default implementation would leave crash recovery and automatic refund broken — the exact scenarios the saga exists for. Same reason the principal is the constant `"rental-service"` and never `SecurityContextHolder`'s.
+- **The configuration class must stay unannotated.** A `@Configuration`/`@Component` on it registers the interceptor in the parent context, from which *every* Feign client inherits it — including `CarClient`, whose inventory endpoints are `permitAll` and work today with Keycloak stopped. It would silently make Keycloak an availability dependency of `POST /api/rentals`. `PaymentClientTokenConfigurationTest` guards this.
+- **Only `PaymentClient` gets the token.** `CarClient` (both here and in maintenance-service) sends none, by design.
+
+Config lives in the external repo (`rental-service-dev.yml`) under `spring.security.oauth2.client.registration.keycloak` / `provider.keycloak`. `spring-boot-starter-oauth2-client` is declared in `rental-service/pom.xml` only — not `common-package`, since no other service needs it.
 - Consequence to keep in mind: because `/api/cars/**` is `permitAll`, the `@Secured("ROLE_admin")` on `inventory-service/CarsController#getAll` — the only method-level security annotation in the repo — is the sole gate on that path.
 - `/api/payments/check` is in the permitAll list but **no controller declares it**. Dead rule.
 - **The gateway does not authenticate.** Every service validates its own token.
@@ -383,7 +398,7 @@ OutboxRelay  @Scheduled(fixedDelay = 5000)
 | Client | Target | Endpoint | Resilience | Fallback throws |
 |---|---|---|---|---|
 | rental-service `CarClient` | inventory-service | `GET /api/cars/check-car-available/{carId}`, `GET /api/cars/get-car-for-invoice/{carId}` | `@Retry("rentalToInventory")` on `checkIfCarAvailable` only | `BusinessException` → 422 |
-| rental-service `PaymentClient` | payment-service | `POST /api/payments/process-rental-payment`, `POST /api/payments/refund-rental-payment` — both take a leading `Idempotency-Key` header | none | `BusinessException` → 422 |
+| rental-service `PaymentClient` | payment-service | `POST /api/payments/process-rental-payment`, `POST /api/payments/refund-rental-payment` — both take a leading `Idempotency-Key` header, and both carry a `client_credentials` service-account bearer token added by `PaymentClientTokenConfiguration` (see §11) | none | `BusinessException` → 422 |
 | maintenance-service `CarClient` | inventory-service | `GET /api/cars/check-car-available/{carId}` | `@Retry("maintenanceToInventory")` | `BusinessException` → 422 |
 
 Resilience4j is on the classpath via `common-package`, but there are **zero `@CircuitBreaker` annotations** and only the 2 `@Retry` above. All resilience4j YAML lives in the external config repo.
@@ -433,7 +448,7 @@ STARTED --charge succeeds--> PAYMENT_CHARGED --rental saved + saga COMPLETED--> 
 
 ## 14) Testing
 
-**Current state:** ~236 unit tests across `common-package` and all 6 business services, covering `*Manager`, `*BusinessRules`, `*Controller`, `*Consumer`, `*ClientFallback`, `business/outbox/*` (the 3 JPA services), and (rental-service only) `business/saga/*` classes. All are plain Mockito/AssertJ unit tests or `MockMvcBuilders.standaloneSetup` controller tests — no `@SpringBootTest`, no Spring context, no config-server or database dependency. They pass with all backing infrastructure stopped. The old default `*ApplicationTests.java` `contextLoads()` stubs (one per module, Spring Initializr boilerplate) have been deleted — they required a live config-server/Keycloak to load the context and asserted nothing. `spring-security-test` is not declared anywhere; controller tests that need `@Valid` enforcement use `standaloneSetup`, which wires Bean Validation automatically without a security context.
+**Current state:** ~244 unit tests across `common-package` and all 6 business services, covering `*Manager`, `*BusinessRules`, `*Controller`, `*Consumer`, `*ClientFallback`, `business/outbox/*` (the 3 JPA services), and (rental-service only) `business/saga/*` and `PaymentClientTokenConfiguration`. All are plain Mockito/AssertJ unit tests or `MockMvcBuilders.standaloneSetup` controller tests — no `@SpringBootTest`, no Spring context, no config-server or database dependency. They pass with all backing infrastructure stopped. The old default `*ApplicationTests.java` `contextLoads()` stubs (one per module, Spring Initializr boilerplate) have been deleted — they required a live config-server/Keycloak to load the context and asserted nothing. `spring-security-test` is not declared anywhere; controller tests that need `@Valid` enforcement use `standaloneSetup`, which wires Bean Validation automatically without a security context.
 
 **Mockito pitfall hit while testing the saga (worth remembering):** re-stubbing a mock method with `when(mock.method(any())).thenX(...)` a second time, when the method's *first* stub was a side-effecting `thenAnswer(...)`, re-invokes that first Answer as a side effect of setting up the second stub — because `when(...)` has to actually call the mock method to record it, and `any()` evaluates to `null` at that call site. If the Answer dereferences its argument (e.g. `((Consumer) inv.getArgument(0)).accept(...)`), this NPEs during test setup, not during the real assertion. Fix: use `doThrow(...).when(mock).method(any())` (or `doAnswer`/`doReturn`) for the *second* stub — that syntax records the stub without re-triggering the currently active one.
 
@@ -483,7 +498,7 @@ Approved defaults (all declared in `common-package/pom.xml`):
 - HTTP/REST: Spring MVC (`spring-boot-starter-web`)
 - Validation: Bean Validation on `*Request` DTOs
 - Persistence: Spring Data JPA / Spring Data MongoDB (per service) + driver
-- Security: Spring Security OAuth2 Resource Server
+- Security: Spring Security OAuth2 Resource Server. **`spring-boot-starter-oauth2-client` is declared in `rental-service/pom.xml` only** — it is what obtains the `client_credentials` service-account token for the payment calls (§11); no other service makes an authenticated outbound call.
 - Platform: Spring Cloud `2022.0.2` — config client, Eureka client, OpenFeign, gateway, circuitbreaker-resilience4j
 - Messaging: `spring-kafka`
 - Mapping: ModelMapper 3.1.1
@@ -517,6 +532,12 @@ Approved defaults (all declared in `common-package/pom.xml`):
 - Event delivery is at-least-once and up to 5 seconds late. Anything that assumed inline publishing (a read-your-write against `filter-service` right after a `POST`) will look broken and isn't.
 - `KafkaProducer.sendMessage` logs the whole event via `event.toString()`, which for `RentalPaymentCreatedEvent` includes `cardHolder` — §9 says never log PII. Pre-existing; not fixed here.
 - `InvoiceManager` injects a `KafkaProducer` it never uses. Pre-existing dead field.
+- Annotating `PaymentClientTokenConfiguration` with `@Configuration`/`@Component` silently widens the Feign token interceptor to every client in rental-service, including `CarClient` — the app still starts and still works while Keycloak is up, then fails with *inventory-service*'s message when it isn't. A test guards it; don't delete the test.
+- `authorization-grant-type` in the external config must be `client_credentials` with an **underscore**. A hyphen passes startup validation and then makes `authorize()` return `null` on the first payment call.
+- A **missing** `client-secret` produces no startup error at all: `ClientRegistration` defaults the auth method to `NONE` and Keycloak answers with 401 `invalid_client` at first use.
+- Creating the `service` realm role is not enough — it must be assigned on the client's **Service accounts roles** tab. If it isn't, a valid token is still issued and payment-service returns 403, which the fallback reports as `PAYMENT DOWN`. Decode `realm_access.roles` rather than guessing from the status code.
+- The service token is cached ~4 minutes (5-min Keycloak lifespan minus a 60s clock skew). An expired-token 401 is **not** retried and does not evict the cache entry.
+- `COMPENSATION_FAILED` is excluded from `SagaRecoveryScheduler.RECOVERABLE`, so a refund that fails because Keycloak was momentarily down is never retried: the customer stays charged. The interceptor's ERROR log is the only signal.
 
 ---
 

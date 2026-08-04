@@ -7,6 +7,7 @@ import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestHeader;
 
 @FeignClient(name = "payment-service",
+        configuration = PaymentClientTokenConfiguration.class,
         fallback = PaymentClientFallback.class)
 public interface PaymentClient {
     @PostMapping(value = "/api/payments/process-rental-payment")
